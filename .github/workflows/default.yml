@@ -108,7 +108,6 @@ jobs:
           ./configure \
             --target=${{ matrix.vpx_target }} \
             --prefix="$DEPS_PREFIX" \
-            --sdk-path="$ANDROID_NDK_HOME" \
             --disable-examples \
             --disable-unit-tests \
             --disable-tools \
