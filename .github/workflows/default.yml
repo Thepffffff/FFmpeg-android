@@ -82,7 +82,7 @@ jobs:
 
       # ---------- OpenH264 (static, BSD-licensed H.264 codec) ----------
       - name: Clone OpenH264
-        run: git clone --depth 1 https://github.com/cisco/openh264.git openh264-src
+        run: git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git openh264-src
 
       - name: Build OpenH264 for ${{ matrix.abi }}
         working-directory: openh264-src
@@ -101,6 +101,13 @@ jobs:
       # generate a pkgconfig file (that only happens via the shared/install
       # targets), so FFmpeg's configure can't find it via pkg-config unless
       # we write one ourselves.
+      #
+      # NOTE: openh264 is a C++ library. FFmpeg's require_pkg_config link-test
+      # compiles a plain C test program and links it straight against
+      # -lopenh264, so without the C++ runtime on the link line that test
+      # fails and configure reports it generically as "not found using
+      # pkg-config" (this is the same failure mode as the well-documented
+      # x265/libstdc++ pkg-config issue). -lc++ pulls in Android NDK's libc++.
       - name: Generate openh264 pkg-config file
         run: |
           set -e
@@ -114,7 +121,7 @@ jobs:
           Name: openh264
           Description: OpenH264: H.264 codec library
           Version: 2.6.0
-          Libs: -L\${libdir} -lopenh264
+          Libs: -L\${libdir} -lopenh264 -lc++
           Libs.private: -lm -ldl
           Cflags: -I\${includedir}
           EOF
@@ -191,6 +198,13 @@ jobs:
 
           echo "Build output for ${{ matrix.abi }}:"
           find "$FFMPEG_PREFIX" -maxdepth 2
+
+      - name: Upload config.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-config-log-${{ matrix.abi }}
+          path: ffmpeg-src/ffbuild/config.log
 
       - name: Upload artifact for ${{ matrix.abi }}
         uses: actions/upload-artifact@v4
