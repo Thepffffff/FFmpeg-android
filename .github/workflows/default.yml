@@ -97,6 +97,18 @@ jobs:
             install-static \
             PREFIX="$DEPS_PREFIX"
 
+      # Diagnostic only: confirms the static lib actually exists and isn't
+      # empty before we trust it further down the pipeline. Useful for
+      # narrowing down whether a later "not found using pkg-config" failure
+      # is a build problem here vs. a link-flag problem in FFmpeg's configure.
+      - name: Verify OpenH264 static lib
+        run: |
+          echo "--- $DEPS_PREFIX/lib ---"
+          ls -la "$DEPS_PREFIX/lib" || true
+          echo "--- $DEPS_PREFIX/include ---"
+          find "$DEPS_PREFIX/include" -type f || true
+          file "$DEPS_PREFIX/lib/libopenh264.a" || true
+
       # install-static only installs the header + libopenh264.a, it does not
       # generate a pkgconfig file (that only happens via the shared/install
       # targets), so FFmpeg's configure can't find it via pkg-config unless
@@ -130,23 +142,42 @@ jobs:
       - name: Clone libvpx
         run: git clone --depth 1 https://chromium.googlesource.com/webm/libvpx.git libvpx-src
 
-      # NOTE: the job-level AS env var (set above) points at the NDK's clang,
-      # which is correct for FFmpeg but WRONG for libvpx. libvpx's own
-      # configure.sh only auto-detects nasm/yasm as the assembler when AS is
-      # unset; since GITHUB_ENV vars persist across every step in the job, AS
-      # arrives here already "set" to clang, so libvpx bakes clang in as its
-      # assembler and then calls it with NASM-style flags (-f elf64 ...),
-      # which clang doesn't understand. Unset AS and force --as=nasm so
-      # libvpx uses the real x86 assembler regardless of inherited env state.
+      # Two separate, arch-specific workarounds are needed here:
+      #
+      # 1. x86 / x86_64: the job-level AS env var (set above) points at the
+      #    NDK's clang, which is correct for FFmpeg but wrong for libvpx.
+      #    libvpx's configure.sh only auto-detects nasm/yasm as the assembler
+      #    when AS is unset; since GITHUB_ENV vars persist across every step
+      #    in the job, AS arrives here already "set" to clang, so libvpx
+      #    bakes clang in as its assembler and then calls it with NASM-style
+      #    flags (-f elf64 ...), which clang doesn't understand.
+      #
+      # 2. armeabi-v7a: the hand-written NEON assembly files
+      #    (vpx_dsp/arm/*_neon_asm.asm.S) are assembled by calling $(AS)
+      #    directly with raw GNU-as flags (-march=armv7-a, --defsym ...).
+      #    Modern NDKs (this workflow uses r26d) no longer ship a standalone
+      #    binutils 'as' that understands those flags, and clang's integrated
+      #    assembler rejects them too since they aren't passed through -Wa,.
+      #    This is a known libvpx/NDK incompatibility; --disable-neon-asm
+      #    skips the hand-written asm and falls back to NEON C intrinsics.
       - name: Build libvpx for ${{ matrix.abi }}
         working-directory: libvpx-src
         run: |
           set -e
-          unset AS
+
+          VPX_EXTRA_FLAGS=""
+          if [ "${{ matrix.arch }}" = "x86" ] || [ "${{ matrix.arch }}" = "x86_64" ]; then
+            unset AS
+            VPX_EXTRA_FLAGS="--as=nasm"
+          fi
+          if [ "${{ matrix.abi }}" = "armeabi-v7a" ]; then
+            VPX_EXTRA_FLAGS="$VPX_EXTRA_FLAGS --disable-neon-asm"
+          fi
+
           ./configure \
             --target=${{ matrix.vpx_target }} \
             --prefix="$DEPS_PREFIX" \
-            --as=nasm \
+            $VPX_EXTRA_FLAGS \
             --disable-examples \
             --disable-unit-tests \
             --disable-tools \
