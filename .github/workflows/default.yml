@@ -97,6 +97,28 @@ jobs:
             install-static \
             PREFIX="$DEPS_PREFIX"
 
+      # install-static only installs the header + libopenh264.a, it does not
+      # generate a pkgconfig file (that only happens via the shared/install
+      # targets), so FFmpeg's configure can't find it via pkg-config unless
+      # we write one ourselves.
+      - name: Generate openh264 pkg-config file
+        run: |
+          set -e
+          mkdir -p "$DEPS_PREFIX/lib/pkgconfig"
+          cat > "$DEPS_PREFIX/lib/pkgconfig/openh264.pc" <<EOF
+          prefix=$DEPS_PREFIX
+          exec_prefix=\${prefix}
+          libdir=\${exec_prefix}/lib
+          includedir=\${prefix}/include
+
+          Name: openh264
+          Description: OpenH264: H.264 codec library
+          Version: 2.6.0
+          Libs: -L\${libdir} -lopenh264
+          Libs.private: -lm -ldl
+          Cflags: -I\${includedir}
+          EOF
+
       # ---------- libvpx (static, royalty-free VP8/VP9) ----------
       - name: Clone libvpx
         run: git clone --depth 1 https://chromium.googlesource.com/webm/libvpx.git libvpx-src
