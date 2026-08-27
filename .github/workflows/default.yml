@@ -84,10 +84,24 @@ jobs:
       - name: Clone OpenH264
         run: git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git openh264-src
 
+      # NOTE (x86/32-bit only): platform-android.mk adds -fpic to CFLAGS for
+      # C/C++ sources but only sets the NASM output format (-f elf) for the
+      # hand-written x86 .asm kernels, with no PIC define. 32-bit "-f elf"
+      # NASM output defaults to absolute (non-PIC) addressing, which fails to
+      # link into Android's mandatory PIE binaries with:
+      #   "relocation R_386_32 cannot be used against local symbol;
+      #    recompile with -fPIC"
+      # -DPIC switches the asm kernels to GOT-relative addressing. 64-bit
+      # (x86_64) doesn't need this since elf64/RIP-relative asm is PIC-safe
+      # by default (confirmed: our x86_64 leg already links fine).
       - name: Build OpenH264 for ${{ matrix.abi }}
         working-directory: openh264-src
         run: |
           set -e
+          EXTRA_MAKE_ARGS=""
+          if [ "${{ matrix.openh264_arch }}" = "x86" ]; then
+            EXTRA_MAKE_ARGS="ASMFLAGS=-DPIC"
+          fi
           make -j"$(nproc)" \
             OS=android \
             ARCH=${{ matrix.openh264_arch }} \
@@ -95,12 +109,11 @@ jobs:
             NDKLEVEL="${API_LEVEL}" \
             TARGET="android-${API_LEVEL}" \
             install-static \
-            PREFIX="$DEPS_PREFIX"
+            PREFIX="$DEPS_PREFIX" \
+            $EXTRA_MAKE_ARGS
 
       # Diagnostic only: confirms the static lib actually exists and isn't
-      # empty before we trust it further down the pipeline. Useful for
-      # narrowing down whether a later "not found using pkg-config" failure
-      # is a build problem here vs. a link-flag problem in FFmpeg's configure.
+      # empty before we trust it further down the pipeline.
       - name: Verify OpenH264 static lib
         run: |
           echo "--- $DEPS_PREFIX/lib ---"
@@ -114,12 +127,12 @@ jobs:
       # targets), so FFmpeg's configure can't find it via pkg-config unless
       # we write one ourselves.
       #
-      # NOTE: openh264 is a C++ library. FFmpeg's require_pkg_config link-test
-      # compiles a plain C test program and links it straight against
-      # -lopenh264, so without the C++ runtime on the link line that test
-      # fails and configure reports it generically as "not found using
-      # pkg-config" (this is the same failure mode as the well-documented
-      # x265/libstdc++ pkg-config issue). -lc++ pulls in Android NDK's libc++.
+      # openh264 is a C++ library; FFmpeg's require_pkg_config link-test
+      # compiles a plain C test program and links straight against
+      # -lopenh264, so without the C++ runtime on the link line that fails
+      # and configure reports it generically as "not found using
+      # pkg-config" (same failure mode as the documented x265/libstdc++
+      # pkg-config issue). -lc++ pulls in Android NDK's libc++.
       - name: Generate openh264 pkg-config file
         run: |
           set -e
@@ -142,24 +155,22 @@ jobs:
       - name: Clone libvpx
         run: git clone --depth 1 https://chromium.googlesource.com/webm/libvpx.git libvpx-src
 
-      # Two separate, arch-specific workarounds are needed here:
+      # Two separate, arch-specific workarounds:
       #
       # 1. x86 / x86_64: the job-level AS env var (set above) points at the
-      #    NDK's clang, which is correct for FFmpeg but wrong for libvpx.
-      #    libvpx's configure.sh only auto-detects nasm/yasm as the assembler
-      #    when AS is unset; since GITHUB_ENV vars persist across every step
-      #    in the job, AS arrives here already "set" to clang, so libvpx
-      #    bakes clang in as its assembler and then calls it with NASM-style
-      #    flags (-f elf64 ...), which clang doesn't understand.
+      #    NDK's clang, correct for FFmpeg but wrong for libvpx. libvpx's
+      #    configure.sh only auto-detects nasm/yasm when AS is unset; since
+      #    GITHUB_ENV vars persist across every step in the job, AS arrives
+      #    here already "set" to clang, which then gets called with
+      #    NASM-style flags (-f elf64 ...) it doesn't understand.
       #
-      # 2. armeabi-v7a: the hand-written NEON assembly files
-      #    (vpx_dsp/arm/*_neon_asm.asm.S) are assembled by calling $(AS)
-      #    directly with raw GNU-as flags (-march=armv7-a, --defsym ...).
-      #    Modern NDKs (this workflow uses r26d) no longer ship a standalone
-      #    binutils 'as' that understands those flags, and clang's integrated
-      #    assembler rejects them too since they aren't passed through -Wa,.
-      #    This is a known libvpx/NDK incompatibility; --disable-neon-asm
-      #    skips the hand-written asm and falls back to NEON C intrinsics.
+      # 2. armeabi-v7a: hand-written NEON assembly (*_neon_asm.asm.S) is
+      #    assembled by calling $(AS) directly with raw GNU-as flags
+      #    (-march=armv7-a, --defsym ...). Modern NDKs (r26d here) no longer
+      #    ship a standalone binutils 'as' that understands those flags, and
+      #    clang's integrated assembler rejects them too since they aren't
+      #    passed through -Wa,. --disable-neon-asm falls back to NEON C
+      #    intrinsics instead.
       - name: Build libvpx for ${{ matrix.abi }}
         working-directory: libvpx-src
         run: |
