@@ -39,13 +39,13 @@ jobs:
             openh264_arch: arm
             ffmpeg_extra: ""
           # See the long comment on the FFmpeg configure step for why x86
-          # (and only x86) needs --disable-inline-asm.
+          # (and only x86) needs --disable-inline-asm and --enable-pic.
           - abi: x86
             arch: x86
             triple: i686-linux-android
             vpx_target: x86-android-gcc
             openh264_arch: x86
-            ffmpeg_extra: "--disable-inline-asm"
+            ffmpeg_extra: "--disable-inline-asm --enable-pic"
           - abi: x86_64
             arch: x86_64
             triple: x86_64-linux-android
@@ -226,8 +226,9 @@ jobs:
 
           # Per-ABI extra configure flags from the matrix.
           #
-          # x86 (32-bit) only: --disable-inline-asm
+          # x86 (32-bit) only: --disable-inline-asm --enable-pic
           #
+          # --disable-inline-asm:
           # Android mandates PIC/PIE, and on i686 that permanently reserves
           # EBX as the GOT pointer (esp/ebp are unusable too). FFmpeg's
           # legacy MMX *inline* asm in libswscale/x86/rgb2rgb_template.c
@@ -238,30 +239,29 @@ jobs:
           # own base register. That exceeds what i686+PIC leaves free, so
           # clang bails with:
           #   error: inline assembly requires more registers than available
-          #
           # configure doesn't catch it: its "check_inline_asm ebx_available"
           # probe is a two-line snippet that clang happily accepts, so
-          # HAVE_EBX_AVAILABLE=1 and inline asm stays on. The probe simply
-          # doesn't model real register pressure.
+          # HAVE_EBX_AVAILABLE=1 and inline asm stays on -- the probe simply
+          # doesn't model real register pressure. --disable-inline-asm turns
+          # off ONLY the inline (__asm__ volatile) code paths; the external
+          # NASM/x86asm SIMD is unaffected.
           #
-          # --disable-inline-asm turns off ONLY the inline (__asm__ volatile)
-          # code paths. The external NASM/x86asm SIMD -- libswscale/x86/*.asm,
-          # libavcodec/x86/*.asm, i.e. everything that actually carries
-          # performance in modern FFmpeg -- is unaffected and still builds.
-          # The disabled templates here are legacy MMX/3DNOW.
+          # --enable-pic:
+          # FFmpeg only threads -DPIC into X86ASMFLAGS (which its
+          # x86inc.asm/x86util.asm headers gate GOT-relative addressing
+          # macros on via "%ifdef PIC") when its own internal "pic" build
+          # flag is on, and that isn't reliably auto-derived from
+          # --enable-shared alone on every target -- confirmed by the actual
+          # failure: libavutil/x86/tx_float.o linking with
+          # "relocation R_386_32 ... recompile with -fPIC" even though we
+          # already pass --enable-shared. This is why essentially every
+          # published FFmpeg-for-Android build script passes --enable-pic
+          # explicitly rather than relying on it being implied.
           #
           # Not applicable to the other ABIs: x86_64 has 16 GPRs plus
-          # RIP-relative addressing, and ARM/ARM64 never compile this file.
-          #
-          # Rejected alternatives:
-          #   --disable-mmx        -> in FFmpeg sse depends on mmxext depends
-          #                           on mmx, so this kills ALL x86 SIMD
-          #                           including the external asm. Real perf loss.
-          #   patch HAVE_EBX_AVAILABLE=0 -> no effect; this block never names
-          #                           ebx, it just can't find enough free regs.
-          #   drop PIC             -> not possible, Android requires PIE.
-          #   patch the .c source  -> correct upstream-style fix, but it's a
-          #                           rebase liability on every FFmpeg bump.
+          # RIP-relative addressing (PIC-safe by default), and ARM/ARM64
+          # handle PIC through the compiler rather than an asm-level define,
+          # and never compile rgb2rgb_template.c's mmxext path.
           EXTRA_FLAGS="$EXTRA_FLAGS ${{ matrix.ffmpeg_extra }}"
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
