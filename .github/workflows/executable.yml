@@ -1,4 +1,4 @@
-name: Build FFmpeg executable for Android (with OpenH264 + libvpx + libopus + dav1d + SVT-AV1)
+name: Build FFmpeg + ffprobe executable for Android (with OpenH264 + libvpx + libopus + dav1d + SVT-AV1)
 
 on:
   workflow_dispatch:
@@ -107,7 +107,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake build-essential cmake git \
-            libtool pkg-config wget yasm nasm meson ninja-build
+            libtool pkg-config wget yasm nasm meson ninja-build zip unzip
 
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
@@ -433,7 +433,7 @@ jobs:
           git clone --depth 1 --branch "${FFMPEG_VERSION}" \
             https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
 
-      - name: Configure and build FFmpeg for ${{ matrix.abi }}
+      - name: Configure and build FFmpeg + ffprobe for ${{ matrix.abi }}
         working-directory: ffmpeg-src
         run: |
           set -e
@@ -487,16 +487,21 @@ jobs:
             EXTRA_FLAGS="$EXTRA_FLAGS --enable-libsvtav1"
           fi
 
-          # Building the `ffmpeg` CLI executable, not the jniLibs .so set:
-          # FFmpeg's own libs (avutil/avcodec/...) and every codec dep built
-          # above are static (.a), and get linked straight into the single
-          # `ffmpeg` binary. The only things still linked dynamically are
-          # bionic's own libc/libm/libdl/liblog, which are guaranteed to
-          # already be present on every Android device -- that's what
-          # makes a single copied-over file enough to run, no other files
-          # or LD_LIBRARY_PATH juggling needed on-device.
-          # --disable-ffplay/--disable-ffprobe guarantee exactly one
-          # program comes out of `make install` (see the rename below).
+          # Building both the `ffmpeg` and `ffprobe` CLI executables, not
+          # the jniLibs .so set: FFmpeg's own libs (avutil/avcodec/...) and
+          # every codec dep built above are static (.a), and get linked
+          # straight into the two standalone binaries. The only things
+          # still linked dynamically are bionic's own libc/libm/libdl/
+          # liblog, guaranteed present on every Android device -- that's
+          # what makes copying the two files over enough to run, no other
+          # files or LD_LIBRARY_PATH juggling needed on-device.
+          #
+          # ffprobe is now REQUIRED downstream: FFmpegManager (the consumer
+          # of this build's output) refuses to use an install directory
+          # unless it contains both an ffmpeg and an ffprobe binary, so
+          # --disable-ffprobe must NOT be passed. ffplay stays disabled
+          # since it needs SDL2 (not built here) and nothing downstream
+          # uses it -- so exactly two programs come out of `make install`.
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
           ./configure \
             --prefix="$FFMPEG_PREFIX" \
@@ -514,7 +519,6 @@ jobs:
             --enable-static \
             --disable-doc \
             --disable-ffplay \
-            --disable-ffprobe \
             --disable-symver \
             --disable-debug \
             --enable-small \
@@ -539,14 +543,31 @@ jobs:
           make -j"$(nproc)"
           make install
 
-          # Exactly one CLI tool comes out of install (ffplay/ffprobe are
-          # disabled above), so the "single executable" case always
-          # applies here -- rename it in place per that naming rule.
-          mv "$FFMPEG_PREFIX/bin/ffmpeg" "$FFMPEG_PREFIX/bin/FFmpeg-android-${{ matrix.abi }}-exec"
-          chmod +x "$FFMPEG_PREFIX/bin/FFmpeg-android-${{ matrix.abi }}-exec"
-
           echo "Build output for ${{ matrix.abi }}:"
           find "$FFMPEG_PREFIX" -maxdepth 2
+
+      # `make install` produces $FFMPEG_PREFIX/bin/ffmpeg and .../ffprobe
+      # with those exact bare names -- no extension, since this is a
+      # non-Windows target. That's the same name shape FFmpegManager's
+      # findExtractedFile() looks for on disk after extraction
+      # (OS_TYPE.executableName("ffmpeg") / ("ffprobe")), so the binaries
+      # are packaged as-is below, deliberately NOT renamed. Only the
+      # *archive* gets the descriptive "FFmpeg-android-<abi>" name;
+      # findExtractedFile() walks the whole extracted tree by filename, so
+      # it doesn't care whether the two binaries sit at the zip root or in
+      # a subfolder -- zip -j (junk paths) is used purely to keep the
+      # archive flat and simple, not because a specific layout is required.
+      - name: Package ffmpeg + ffprobe into archive for ${{ matrix.abi }}
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          chmod +x "$FFMPEG_PREFIX/bin/ffmpeg" "$FFMPEG_PREFIX/bin/ffprobe"
+
+          ARCHIVE="$GITHUB_WORKSPACE/dist/FFmpeg-android-${{ matrix.abi }}.zip"
+          ( cd "$FFMPEG_PREFIX/bin" && zip -j "$ARCHIVE" ffmpeg ffprobe )
+
+          echo "Archive contents for ${{ matrix.abi }}:"
+          unzip -l "$ARCHIVE"
 
       - name: Upload config.log on failure
         if: failure()
@@ -555,11 +576,11 @@ jobs:
           name: ffmpeg-config-log-${{ matrix.abi }}
           path: ffmpeg-src/ffbuild/config.log
 
-      - name: Upload artifact for ${{ matrix.abi }}
+      - name: Upload archive for ${{ matrix.abi }}
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-android-${{ matrix.abi }}
-          path: android-libs/${{ matrix.abi }}
+          path: dist/FFmpeg-android-${{ matrix.abi }}.zip
           if-no-files-found: error
 
   package:
@@ -570,9 +591,10 @@ jobs:
       - name: Build summary
         run: |
           {
-            echo "### FFmpeg for Android -- build summary"
+            echo "### FFmpeg + ffprobe for Android -- build summary"
             echo ""
-            echo "Output: one static \`ffmpeg\` CLI executable per ABI (ffplay/ffprobe disabled), named \`FFmpeg-android-<abi>-exec\`."
+            echo "Output: one \`FFmpeg-android-<abi>.zip\` per ABI, each containing"
+            echo "an \`ffmpeg\` and an \`ffprobe\` binary (bare names, no renaming)."
             echo ""
             echo "| Component | Version | Status |"
             echo "|---|---|---|"
@@ -604,24 +626,23 @@ jobs:
           pattern: ffmpeg-android-*
           merge-multiple: false
 
-      - name: Collect per-ABI executables
+      - name: Collect per-ABI zip archives
         run: |
           set -e
-          mkdir -p executables
+          mkdir -p archives
           for d in android-libs/ffmpeg-android-*; do
             abi=$(basename "$d" | sed 's/ffmpeg-android-//')
-            exec_path="$d/bin/FFmpeg-android-${abi}-exec"
-            if [ ! -f "$exec_path" ]; then
-              echo "::error::Expected executable not found: $exec_path"
+            zip_path="$d/FFmpeg-android-${abi}.zip"
+            if [ ! -f "$zip_path" ]; then
+              echo "::error::Expected archive not found: $zip_path"
               exit 1
             fi
-            cp "$exec_path" executables/
-            chmod +x "executables/FFmpeg-android-${abi}-exec"
+            cp "$zip_path" archives/
           done
-          find executables -type f -exec ls -la {} \;
+          find archives -type f -exec ls -la {} \;
 
-      - name: Upload combined executables bundle
+      - name: Upload combined archives bundle
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-android-executables
-          path: executables
+          name: ffmpeg-android-archives
+          path: archives
