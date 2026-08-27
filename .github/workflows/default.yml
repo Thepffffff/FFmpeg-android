@@ -30,22 +30,28 @@ jobs:
             triple: aarch64-linux-android
             vpx_target: arm64-android-gcc
             openh264_arch: arm64
+            ffmpeg_extra: ""
           - abi: armeabi-v7a
             arch: arm
             cpu: armv7-a
             triple: armv7a-linux-androideabi
             vpx_target: armv7-android-gcc
             openh264_arch: arm
+            ffmpeg_extra: ""
+          # See the long comment on the FFmpeg configure step for why x86
+          # (and only x86) needs --disable-inline-asm.
           - abi: x86
             arch: x86
             triple: i686-linux-android
             vpx_target: x86-android-gcc
             openh264_arch: x86
+            ffmpeg_extra: "--disable-inline-asm"
           - abi: x86_64
             arch: x86_64
             triple: x86_64-linux-android
             vpx_target: x86_64-android-gcc
             openh264_arch: x86_64
+            ffmpeg_extra: ""
 
     steps:
       - name: Checkout workflow repo
@@ -181,7 +187,6 @@ jobs:
         working-directory: libvpx-src
         run: |
           set -e
-
           VPX_EXTRA_FLAGS=""
           if [ "${{ matrix.arch }}" = "x86" ] || [ "${{ matrix.arch }}" = "x86_64" ]; then
             unset AS
@@ -190,7 +195,6 @@ jobs:
           if [ "${{ matrix.abi }}" = "armeabi-v7a" ]; then
             VPX_EXTRA_FLAGS="$VPX_EXTRA_FLAGS --disable-neon-asm"
           fi
-
           ./configure \
             --target=${{ matrix.vpx_target }} \
             --prefix="$DEPS_PREFIX" \
@@ -215,14 +219,52 @@ jobs:
         working-directory: ffmpeg-src
         run: |
           set -e
-
           EXTRA_FLAGS=""
           if [ "${{ matrix.arch }}" = "arm" ]; then
             EXTRA_FLAGS="--cpu=${{ matrix.cpu }}"
           fi
 
-          export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
+          # Per-ABI extra configure flags from the matrix.
+          #
+          # x86 (32-bit) only: --disable-inline-asm
+          #
+          # Android mandates PIC/PIE, and on i686 that permanently reserves
+          # EBX as the GOT pointer (esp/ebp are unusable too). FFmpeg's
+          # legacy MMX *inline* asm in libswscale/x86/rgb2rgb_template.c
+          # (ff_rgb24toyv12_mmxext, the block at line ~1641) wants four "r"
+          # operands, clobbers eax and edx, AND pulls in
+          # NAMED_CONSTRAINTS_ADD(ff_w1111, ff_bgr2UVOffset) -- which under
+          # PIC turn into GOT-relative memory operands that each need their
+          # own base register. That exceeds what i686+PIC leaves free, so
+          # clang bails with:
+          #   error: inline assembly requires more registers than available
+          #
+          # configure doesn't catch it: its "check_inline_asm ebx_available"
+          # probe is a two-line snippet that clang happily accepts, so
+          # HAVE_EBX_AVAILABLE=1 and inline asm stays on. The probe simply
+          # doesn't model real register pressure.
+          #
+          # --disable-inline-asm turns off ONLY the inline (__asm__ volatile)
+          # code paths. The external NASM/x86asm SIMD -- libswscale/x86/*.asm,
+          # libavcodec/x86/*.asm, i.e. everything that actually carries
+          # performance in modern FFmpeg -- is unaffected and still builds.
+          # The disabled templates here are legacy MMX/3DNOW.
+          #
+          # Not applicable to the other ABIs: x86_64 has 16 GPRs plus
+          # RIP-relative addressing, and ARM/ARM64 never compile this file.
+          #
+          # Rejected alternatives:
+          #   --disable-mmx        -> in FFmpeg sse depends on mmxext depends
+          #                           on mmx, so this kills ALL x86 SIMD
+          #                           including the external asm. Real perf loss.
+          #   patch HAVE_EBX_AVAILABLE=0 -> no effect; this block never names
+          #                           ebx, it just can't find enough free regs.
+          #   drop PIC             -> not possible, Android requires PIE.
+          #   patch the .c source  -> correct upstream-style fix, but it's a
+          #                           rebase liability on every FFmpeg bump.
+          EXTRA_FLAGS="$EXTRA_FLAGS ${{ matrix.ffmpeg_extra }}"
 
+          export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
           ./configure \
             --prefix="$FFMPEG_PREFIX" \
             --target-os=android \
@@ -250,10 +292,8 @@ jobs:
             --extra-ldflags="-L$DEPS_PREFIX/lib" \
             --pkg-config-flags="--static" \
             --pkg-config="$(which pkg-config)"
-
           make -j"$(nproc)"
           make install
-
           echo "Build output for ${{ matrix.abi }}:"
           find "$FFMPEG_PREFIX" -maxdepth 2
 
