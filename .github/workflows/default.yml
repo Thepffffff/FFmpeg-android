@@ -86,21 +86,32 @@ jobs:
 
       # NOTE (x86/32-bit only): platform-android.mk adds -fpic to CFLAGS for
       # C/C++ sources but only sets the NASM output format (-f elf) for the
-      # hand-written x86 .asm kernels, with no PIC define. 32-bit "-f elf"
-      # NASM output defaults to absolute (non-PIC) addressing, which fails to
-      # link into Android's mandatory PIE binaries with:
-      #   "relocation R_386_32 cannot be used against local symbol;
-      #    recompile with -fPIC"
-      # -DPIC switches the asm kernels to GOT-relative addressing. 64-bit
-      # (x86_64) doesn't need this since elf64/RIP-relative asm is PIC-safe
-      # by default (confirmed: our x86_64 leg already links fine).
+      # hand-written x86 .asm kernels, no PIC define. That produces
+      # non-PIC-safe relocations that fail to link into Android's mandatory
+      # PIE binaries ("relocation R_386_32 ... recompile with -fPIC").
+      #
+      # We patch -DPIC directly into platform-android.mk's own
+      # "ASMFLAGS += -f elf" line rather than pass ASMFLAGS=-DPIC on the make
+      # command line: a command-line-set variable can't be modified by *any*
+      # makefile assignment afterwards (not even +=) without an explicit
+      # "override" directive, so a command-line override wipes out
+      # arch.mk's -DX86_32 and platform-android.mk's -f elf entirely,
+      # leaving nasm invoked with only "-DPIC" -- missing the output format
+      # and the x86inc.asm arch defines those files depend on for their
+      # register-alias macros (r0, r4d, arg5d, retrq, ...), causing a wall
+      # of "symbol not defined" errors. Patching the makefile in place
+      # avoids that: it accumulates alongside the existing flags instead of
+      # replacing them.
+      # 64-bit (x86_64) doesn't need this: elf64/RIP-relative asm is
+      # PIC-safe by default (already confirmed working).
       - name: Build OpenH264 for ${{ matrix.abi }}
         working-directory: openh264-src
         run: |
           set -e
-          EXTRA_MAKE_ARGS=""
           if [ "${{ matrix.openh264_arch }}" = "x86" ]; then
-            EXTRA_MAKE_ARGS="ASMFLAGS=-DPIC"
+            sed -i '/^ASMFLAGS += -f elf$/a ASMFLAGS += -DPIC' build/platform-android.mk
+            grep -n "ASMFLAGS" build/platform-android.mk
+            grep -q '^ASMFLAGS += -DPIC$' build/platform-android.mk || { echo "ERROR: failed to patch platform-android.mk for -DPIC"; exit 1; }
           fi
           make -j"$(nproc)" \
             OS=android \
@@ -109,8 +120,7 @@ jobs:
             NDKLEVEL="${API_LEVEL}" \
             TARGET="android-${API_LEVEL}" \
             install-static \
-            PREFIX="$DEPS_PREFIX" \
-            $EXTRA_MAKE_ARGS
+            PREFIX="$DEPS_PREFIX"
 
       # Diagnostic only: confirms the static lib actually exists and isn't
       # empty before we trust it further down the pipeline.
