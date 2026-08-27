@@ -17,6 +17,25 @@ on:
         required: false
         type: boolean
         default: true
+      opus_version:
+        description: "Opus tag to build (e.g. v1.6.1)"
+        required: false
+        default: "v1.6.1"
+      dav1d_version:
+        description: "dav1d tag to build (e.g. 1.5.4)"
+        required: false
+        default: "1.5.4"
+      svtav1_version:
+        description: >-
+          SVT-AV1 tag to build (e.g. v2.3.0). MUST stay below v3.0.0 unless
+          ffmpeg_version is also bumped to n8.1+ / a release branch that
+          includes FFmpeg commit d1ed5c06e (SVT-AV1 3.0 init_handle fix,
+          backported to the 6.1/4.4 release branches as 6.1.2+) AND commit
+          a5d4c398b4 (SVT-AV1 4.0 enable_adaptive_quantization removal fix,
+          only in FFmpeg master/8.1+ as of this writing). See the comment
+          above the "Clone SVT-AV1" step for the full explanation.
+        required: false
+        default: "v2.3.0"
   push:
     branches: [ main ]
     paths:
@@ -31,6 +50,13 @@ env:
   # exist at all and resolves to an empty string (which is != 'false').
   ENABLE_DAV1D: ${{ github.event.inputs.enable_dav1d != 'false' }}
   ENABLE_SVTAV1: ${{ github.event.inputs.enable_svtav1 != 'false' }}
+  OPUS_VERSION: ${{ github.event.inputs.opus_version || 'v1.6.1' }}
+  DAV1D_VERSION: ${{ github.event.inputs.dav1d_version || '1.5.4' }}
+  # Default is deliberately older than the current SVT-AV1 release -- see
+  # the workflow_dispatch input description and the comment above the
+  # "Clone SVT-AV1" step for why n6.1 + SVT-AV1 v2.3.0 is the
+  # known-compatible pairing this workflow was tested against.
+  SVTAV1_VERSION: ${{ github.event.inputs.svtav1_version || 'v2.3.0' }}
 
 jobs:
   build:
@@ -227,7 +253,7 @@ jobs:
 
       # ---------- Opus (static, royalty-free speech/audio codec) ----------
       - name: Clone Opus
-        run: git clone --depth 1 --branch v1.6.1 https://github.com/xiph/opus.git opus-src
+        run: git clone --depth 1 --branch "${OPUS_VERSION}" https://github.com/xiph/opus.git opus-src
 
       # Plain autotools project, no asm/PIC gotchas like the video codecs
       # above. --host is just the generic triple (used by config.sub for
@@ -261,7 +287,7 @@ jobs:
       # Optional: toggle with the enable_dav1d workflow_dispatch input.
       - name: Clone dav1d
         if: env.ENABLE_DAV1D == 'true'
-        run: git clone --depth 1 --branch 1.5.4 https://code.videolan.org/videolan/dav1d.git dav1d-src
+        run: git clone --depth 1 --branch "${DAV1D_VERSION}" https://code.videolan.org/videolan/dav1d.git dav1d-src
 
       # dav1d uses Meson, not autotools, so it needs its own cross file
       # rather than a --host triple. needs_exe_wrapper=true stops Meson
@@ -322,9 +348,38 @@ jobs:
 
       # ---------- SVT-AV1 (static, fast AV1 encoder) ----------
       # Optional: toggle with the enable_svtav1 workflow_dispatch input.
+      # Version: svtav1_version workflow_dispatch input (default v2.3.0).
+      #
+      # THIS VERSION IS PINNED DELIBERATELY, NOT ARBITRARILY -- SVT-AV1's
+      # public C API is not stable across majors and FFmpeg's libsvtav1.c
+      # wrapper is compiled against whatever struct/function shape existed
+      # at the time each FFmpeg version was cut:
+      #
+      #   1. SVT-AV1 3.0.0 changed svt_av1_enc_init_handle() from 3 args to
+      #      2 (commit 988e930c on their side). FFmpeg only learned to
+      #      detect and handle both shapes in commit d1ed5c06e (22 Feb
+      #      2025), which was backported into the release/6.1 and
+      #      release/4.4 branches (i.e. tags 6.1.2+), but NOT into the
+      #      frozen "n6.1" tag this workflow defaults to -- n6.1 predates
+      #      the fix entirely and only knows the old 3-arg signature.
+      #   2. SVT-AV1 4.0.0 then removed the enable_adaptive_quantization
+      #      field from EbSvtAv1EncConfiguration. FFmpeg didn't gain a
+      #      workaround for that until commit a5d4c398b4 (~29 Jan 2026),
+      #      which landed in FFmpeg 8.1 -- still not in n6.1 or 6.1.x.
+      #
+      # Building SVT-AV1 4.2.0 against FFmpeg n6.1 hits both of the above
+      # and fails with "no member named 'enable_adaptive_quantization'"
+      # and "too many arguments to function call" on svt_av1_enc_init_handle.
+      # v2.3.0 predates both API breaks, so it links cleanly against n6.1's
+      # wrapper as-is.
+      #
+      # If you bump ffmpeg_version to n8.1 or later (or any branch/tag
+      # containing both commits above), you can also bump svtav1_version
+      # to a current release (e.g. v4.2.0) -- just change both inputs
+      # together on the same run, they are not independent.
       - name: Clone SVT-AV1
         if: env.ENABLE_SVTAV1 == 'true'
-        run: git clone --depth 1 --branch v4.2.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git svtav1-src
+        run: git clone --depth 1 --branch "${SVTAV1_VERSION}" https://gitlab.com/AOMediaCodec/SVT-AV1.git svtav1-src
 
       # Uses CMake with the NDK's own android.toolchain.cmake, which is the
       # documented/supported way to cross-compile CMake projects for
@@ -494,6 +549,34 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Build summary
+        run: |
+          {
+            echo "### FFmpeg for Android -- build summary"
+            echo ""
+            echo "| Component | Version | Status |"
+            echo "|---|---|---|"
+            echo "| FFmpeg | \`${FFMPEG_VERSION}\` | built |"
+            echo "| Android NDK | \`${NDK_VERSION}\` | (min API ${API_LEVEL}) |"
+            echo "| OpenH264 | \`v2.6.0\` | built |"
+            echo "| libvpx | *(unpinned -- latest master at build time)* | built |"
+            echo "| Opus | \`${OPUS_VERSION}\` | built |"
+            if [ "${ENABLE_DAV1D}" = "true" ]; then
+              echo "| dav1d | \`${DAV1D_VERSION}\` | built |"
+            else
+              echo "| dav1d | \`${DAV1D_VERSION}\` | skipped (enable_dav1d=false) |"
+            fi
+            if [ "${ENABLE_SVTAV1}" = "true" ]; then
+              echo "| SVT-AV1 | \`${SVTAV1_VERSION}\` | built |"
+            else
+              echo "| SVT-AV1 | \`${SVTAV1_VERSION}\` | skipped (enable_svtav1=false) |"
+            fi
+            echo "| FFV1 | native (FFmpeg-internal) | always on |"
+            echo "| FLAC | native (FFmpeg-internal) | always on |"
+            echo ""
+            echo "ABIs: arm64-v8a, armeabi-v7a, x86, x86_64"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
