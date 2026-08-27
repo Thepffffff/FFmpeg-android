@@ -1,4 +1,4 @@
-name: Build FFmpeg for Android (with OpenH264 + libvpx)
+name: Build FFmpeg for Android (with OpenH264 + libvpx + libopus + dav1d + SVT-AV1)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,16 @@ on:
         description: "FFmpeg branch/tag to build (e.g. n6.1, release/6.1, master)"
         required: false
         default: "n6.1"
+      enable_dav1d:
+        description: "Build with libdav1d (AV1 decode)"
+        required: false
+        type: boolean
+        default: true
+      enable_svtav1:
+        description: "Build with libsvtav1 (AV1 encode)"
+        required: false
+        type: boolean
+        default: true
   push:
     branches: [ main ]
     paths:
@@ -16,6 +26,11 @@ env:
   FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n6.1' }}
   NDK_VERSION: "r26d"
   API_LEVEL: 21   # minimum Android API level (21 = Android 5.0)
+  # These two default to "true" both on manual runs (unless the checkbox is
+  # unticked) and on the push trigger, where github.event.inputs.* doesn't
+  # exist at all and resolves to an empty string (which is != 'false').
+  ENABLE_DAV1D: ${{ github.event.inputs.enable_dav1d != 'false' }}
+  ENABLE_SVTAV1: ${{ github.event.inputs.enable_svtav1 != 'false' }}
 
 jobs:
   build:
@@ -30,6 +45,7 @@ jobs:
             triple: aarch64-linux-android
             vpx_target: arm64-android-gcc
             openh264_arch: arm64
+            dav1d_cpu_family: aarch64
             ffmpeg_extra: ""
           - abi: armeabi-v7a
             arch: arm
@@ -37,6 +53,7 @@ jobs:
             triple: armv7a-linux-androideabi
             vpx_target: armv7-android-gcc
             openh264_arch: arm
+            dav1d_cpu_family: arm
             ffmpeg_extra: ""
           # See the long comment on the FFmpeg configure step: x86 (32-bit)
           # loses all hand-written x86 SIMD due to a confirmed upstream
@@ -46,12 +63,14 @@ jobs:
             triple: i686-linux-android
             vpx_target: x86-android-gcc
             openh264_arch: x86
+            dav1d_cpu_family: x86
             ffmpeg_extra: "--disable-asm --enable-pic"
           - abi: x86_64
             arch: x86_64
             triple: x86_64-linux-android
             vpx_target: x86_64-android-gcc
             openh264_arch: x86_64
+            dav1d_cpu_family: x86_64
             ffmpeg_extra: ""
 
     steps:
@@ -62,7 +81,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake build-essential cmake git \
-            libtool pkg-config wget yasm nasm
+            libtool pkg-config wget yasm nasm meson ninja-build
 
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
@@ -206,7 +225,154 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      # ---------- FFmpeg (shared, statically links openh264 + libvpx) ----------
+      # ---------- Opus (static, royalty-free speech/audio codec) ----------
+      - name: Clone Opus
+        run: git clone --depth 1 --branch v1.6.1 https://github.com/xiph/opus.git opus-src
+
+      # Plain autotools project, no asm/PIC gotchas like the video codecs
+      # above. --host is just the generic triple (used by config.sub for
+      # feature detection); CC/AR/RANLIB/STRIP are pinned explicitly to the
+      # NDK toolchain set up earlier so the actual compiler used is never in
+      # question regardless of what --host resolves to.
+      # autogen.sh is required because we're building from a git checkout
+      # (no bundled ./configure yet); autoconf/automake/libtool are already
+      # installed above.
+      - name: Build Opus for ${{ matrix.abi }}
+        working-directory: opus-src
+        run: |
+          set -e
+          ./autogen.sh
+          ./configure \
+            --host="${{ matrix.triple }}" \
+            --prefix="$DEPS_PREFIX" \
+            --enable-static \
+            --disable-shared \
+            --disable-doc \
+            --disable-extra-programs \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
+          make -j"$(nproc)"
+          make install
+
+      # `make install` generates $DEPS_PREFIX/lib/pkgconfig/opus.pc
+      # automatically, so no hand-written .pc file is needed here (unlike
+      # OpenH264 above).
+
+      # ---------- dav1d (static, fast AV1 decoder) ----------
+      # Optional: toggle with the enable_dav1d workflow_dispatch input.
+      - name: Clone dav1d
+        if: env.ENABLE_DAV1D == 'true'
+        run: git clone --depth 1 --branch 1.5.4 https://code.videolan.org/videolan/dav1d.git dav1d-src
+
+      # dav1d uses Meson, not autotools, so it needs its own cross file
+      # rather than a --host triple. needs_exe_wrapper=true stops Meson
+      # from trying to execute any target-arch (ARM/x86-Android) binaries
+      # on the x86_64 GitHub runner during its configure-time checks.
+      - name: Generate meson cross file for dav1d (${{ matrix.abi }})
+        if: env.ENABLE_DAV1D == 'true'
+        run: |
+          cat > "$PWD/dav1d-cross-${{ matrix.abi }}.ini" <<EOF
+          [binaries]
+          c = '$CC'
+          cpp = '$CXX'
+          ar = '$AR'
+          strip = '$STRIP'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = '${{ matrix.dav1d_cpu_family }}'
+          cpu = '${{ matrix.dav1d_cpu_family }}'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          EOF
+
+      # enable_asm stays on for all four ABIs: unlike the FFmpeg x86 case
+      # below, dav1d's own x86 asm is written with PIC in mind from the
+      # start (it ships on 32-bit x86 Android today via apps like
+      # ExoPlayer). If this ever regresses on a future dav1d/NDK
+      # combination, the fix is the same shape as the FFmpeg one: pass
+      # -Denable_asm=false for the x86 ABI only.
+      - name: Build dav1d for ${{ matrix.abi }}
+        if: env.ENABLE_DAV1D == 'true'
+        working-directory: dav1d-src
+        run: |
+          set -e
+          meson setup build \
+            --cross-file="$PWD/../dav1d-cross-${{ matrix.abi }}.ini" \
+            --prefix="$DEPS_PREFIX" \
+            --libdir=lib \
+            --default-library=static \
+            --buildtype=release \
+            -Denable_asm=true \
+            -Denable_tools=false \
+            -Denable_examples=false \
+            -Denable_tests=false
+          ninja -C build
+          ninja -C build install
+
+      - name: Upload dav1d meson log on failure
+        if: failure() && env.ENABLE_DAV1D == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dav1d-meson-log-${{ matrix.abi }}
+          path: dav1d-src/build/meson-logs/meson-log.txt
+          if-no-files-found: ignore
+
+      # ---------- SVT-AV1 (static, fast AV1 encoder) ----------
+      # Optional: toggle with the enable_svtav1 workflow_dispatch input.
+      - name: Clone SVT-AV1
+        if: env.ENABLE_SVTAV1 == 'true'
+        run: git clone --depth 1 --branch v4.2.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git svtav1-src
+
+      # Uses CMake with the NDK's own android.toolchain.cmake, which is the
+      # documented/supported way to cross-compile CMake projects for
+      # Android -- it derives the correct clang target triple, sysroot and
+      # API-level flags from ANDROID_ABI/ANDROID_PLATFORM, so CC/CXX are
+      # intentionally left unset here rather than reusing the job-level
+      # ones (mixing the two approaches is more likely to conflict than
+      # help).
+      - name: Build SVT-AV1 for ${{ matrix.abi }}
+        if: env.ENABLE_SVTAV1 == 'true'
+        working-directory: svtav1-src
+        run: |
+          set -e
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-${API_LEVEL} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_APPS=OFF \
+            -DBUILD_DEC=ON \
+            -DBUILD_ENC=ON \
+            -DBUILD_TESTING=OFF
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      # `cmake --install` generates SvtAv1Enc.pc / SvtAv1Dec.pc under
+      # $DEPS_PREFIX/lib/pkgconfig -- exactly the names FFmpeg's configure
+      # probes for with --enable-libsvtav1, so no manual .pc file needed.
+      #
+      # Caveat: SVT-AV1's x86 SIMD is NASM-based like OpenH264/FFmpeg's
+      # above, and 32-bit x86 Android is the one ABI where this class of
+      # lld/PIC bug has repeatedly turned up across this whole toolchain.
+      # It isn't reproduced here, so nothing is disabled pre-emptively --
+      # but if the x86 leg fails specifically in SVT-AV1's own asm, that's
+      # the first thing to suspect (see the CMakeError.log upload below).
+
+      - name: Upload SVT-AV1 CMake log on failure
+        if: failure() && env.ENABLE_SVTAV1 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: svtav1-cmake-log-${{ matrix.abi }}
+          path: svtav1-src/build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+
+      # ---------- FFmpeg (shared, statically links the above) ----------
       - name: Clone FFmpeg source
         run: |
           git clone --depth 1 --branch "${FFMPEG_VERSION}" \
@@ -255,6 +421,17 @@ jobs:
           # armeabi-v7a, and x86_64 are all unaffected and keep full SIMD.
           EXTRA_FLAGS="$EXTRA_FLAGS ${{ matrix.ffmpeg_extra }}"
 
+          # libopus is always on. dav1d/svtav1 are gated on the same
+          # workflow inputs used to decide whether to build them above, so
+          # this can never try to --enable- a library that wasn't built.
+          EXTRA_FLAGS="$EXTRA_FLAGS --enable-libopus"
+          if [ "${ENABLE_DAV1D}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --enable-libdav1d"
+          fi
+          if [ "${ENABLE_SVTAV1}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --enable-libsvtav1"
+          fi
+
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
           ./configure \
             --prefix="$FFMPEG_PREFIX" \
@@ -279,10 +456,20 @@ jobs:
             --enable-version3 \
             --enable-libopenh264 \
             --enable-libvpx \
+            --enable-encoder=ffv1 --enable-decoder=ffv1 \
+            --enable-encoder=flac --enable-decoder=flac \
             --extra-cflags="-I$DEPS_PREFIX/include" \
             --extra-ldflags="-L$DEPS_PREFIX/lib" \
             --pkg-config-flags="--static" \
             --pkg-config="$(which pkg-config)"
+          # Note: FFV1 and FLAC are FFmpeg-native (no external library, so
+          # nothing to build above) and were already compiled in before
+          # this change -- this configure script never uses
+          # --disable-everything/--disable-encoders/--disable-decoders, so
+          # every built-in codec, including these two, was always enabled
+          # by default. The two --enable-*=ffv1/flac pairs above are added
+          # purely to make that support explicit and to make the build
+          # resilient if --disable-everything is ever introduced later.
           make -j"$(nproc)"
           make install
           echo "Build output for ${{ matrix.abi }}:"
