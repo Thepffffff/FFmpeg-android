@@ -1,4 +1,22 @@
-name: Build FFmpeg + ffprobe executable for Android (with OpenH264 + libvpx + libopus + dav1d + SVT-AV1)
+name: Build FFmpeg + ffprobe for Android with libs
+
+# Output shape: for each ABI, one FFmpeg-android-<abi>.zip containing the
+# ffmpeg and ffprobe executables PLUS every FFmpeg shared library
+# (libavcodec.so, libavformat.so, libavutil.so, libavfilter.so,
+# libavdevice.so, libswscale.so, libswresample.so) and libc++_shared.so,
+# all flattened into a single folder. The two executables are linked with
+# -Wl,-rpath,$ORIGIN (see the FFmpeg configure step), so as long as this
+# folder is extracted intact and ffmpeg/ffprobe are run from inside it (or
+# from a path that still has the .so files alongside them), no
+# LD_LIBRARY_PATH or system install step is required.
+#
+# Every third-party codec/library below is built as a static (.a) archive
+# with -fPIC and gets linked INTO FFmpeg's own shared libraries at the
+# final configure/make step -- i.e. you will not find a separate
+# libmp3lame.so or libopus.so in the output, their code lives inside
+# libavcodec.so/libavformat.so. The only extra runtime .so besides
+# FFmpeg's own is libc++_shared.so, copied in because OpenH264 (and
+# potentially SRT) pull in the C++ runtime; see the packaging step.
 
 on:
   workflow_dispatch:
@@ -7,56 +25,97 @@ on:
         description: "FFmpeg branch/tag to build (e.g. n6.1, release/6.1, master)"
         required: false
         default: "n6.1"
-      enable_dav1d:
-        description: "Build with libdav1d (AV1 decode)"
+      lame_version:
+        description: "LAME (libmp3lame) release to build, no 'v' prefix (e.g. 3.100)"
         required: false
-        type: boolean
-        default: true
-      enable_svtav1:
-        description: "Build with libsvtav1 (AV1 encode)"
+        default: "3.100"
+      speex_version:
+        description: "Speex git tag to build (note the capital S, e.g. Speex-1.2.1)"
         required: false
-        type: boolean
-        default: true
+        default: "Speex-1.2.1"
+      opencore_amr_version:
+        description: "opencore-amr release to build, no 'v' prefix (AMR-NB + AMR-WB decode/AMR-NB encode)"
+        required: false
+        default: "0.1.6"
+      vo_amrwbenc_version:
+        description: "vo-amrwbenc release to build, no 'v' prefix (AMR-WB encode)"
+        required: false
+        default: "0.1.3"
+      openh264_version:
+        description: "OpenH264 git tag to build (e.g. v2.6.0)"
+        required: false
+        default: "v2.6.0"
+      vpx_version:
+        description: "libvpx git tag to build (e.g. v1.16.0)"
+        required: false
+        default: "v1.16.0"
+      freetype_version:
+        description: "FreeType git tag to build (dash format, e.g. VER-2-14-2)"
+        required: false
+        default: "VER-2-14-2"
       opus_version:
-        description: "Opus tag to build (e.g. v1.6.1)"
+        description: "Opus git tag to build (e.g. v1.6.1)"
         required: false
         default: "v1.6.1"
-      dav1d_version:
-        description: "dav1d tag to build (e.g. 1.5.4)"
+      libxml2_version:
+        description: "libxml2 git tag to build (e.g. v2.15.2)"
         required: false
-        default: "1.5.4"
+        default: "v2.15.2"
+      srt_version:
+        description: "SRT (Secure Reliable Transport) git tag to build (e.g. v1.5.6)"
+        required: false
+        default: "v1.5.6"
+      webp_version:
+        description: "libwebp git tag to build (e.g. v1.6.0)"
+        required: false
+        default: "v1.6.0"
+      aom_version:
+        description: "libaom (AV1 encode+decode) git tag to build (e.g. v3.13.1)"
+        required: false
+        default: "v3.13.1"
       svtav1_version:
         description: >-
-          SVT-AV1 tag to build (e.g. v2.3.0). MUST stay below v3.0.0 unless
-          ffmpeg_version is also bumped to n8.1+ / a release branch that
-          includes FFmpeg commit d1ed5c06e (SVT-AV1 3.0 init_handle fix,
-          backported to the 6.1/4.4 release branches as 6.1.2+) AND commit
-          a5d4c398b4 (SVT-AV1 4.0 enable_adaptive_quantization removal fix,
-          only in FFmpeg master/8.1+ as of this writing). See the comment
-          above the "Clone SVT-AV1" step for the full explanation.
+          SVT-AV1 git tag to build (e.g. v2.3.0). Paired by default with
+          ffmpeg_version=n6.1 -- see the comment above the "Clone SVT-AV1"
+          step before bumping either one independently of the other.
         required: false
         default: "v2.3.0"
+      openssl_version:
+        description: "OpenSSL git tag to build (e.g. openssl-3.5.8)"
+        required: false
+        default: "openssl-3.5.8"
+      zlib_version:
+        description: "zlib git tag to build (e.g. v1.3.2)"
+        required: false
+        default: "v1.3.2"
   push:
     branches: [ main ]
     paths:
       - '.github/workflows/build-ffmpeg-android.yml'
 
 env:
-  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n6.1' }}
   NDK_VERSION: "r26d"
   API_LEVEL: 21   # minimum Android API level (21 = Android 5.0)
-  # These two default to "true" both on manual runs (unless the checkbox is
-  # unticked) and on the push trigger, where github.event.inputs.* doesn't
-  # exist at all and resolves to an empty string (which is != 'false').
-  ENABLE_DAV1D: ${{ github.event.inputs.enable_dav1d != 'false' }}
-  ENABLE_SVTAV1: ${{ github.event.inputs.enable_svtav1 != 'false' }}
+  # Same fallback pattern for every version: on workflow_dispatch this
+  # picks up whatever the person typed in the form; on the push trigger
+  # github.event.inputs.* doesn't exist at all and resolves to an empty
+  # string, so `||` falls through to the default on the right.
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n6.1' }}
+  LAME_VERSION: ${{ github.event.inputs.lame_version || '3.100' }}
+  SPEEX_VERSION: ${{ github.event.inputs.speex_version || 'Speex-1.2.1' }}
+  OPENCORE_AMR_VERSION: ${{ github.event.inputs.opencore_amr_version || '0.1.6' }}
+  VO_AMRWBENC_VERSION: ${{ github.event.inputs.vo_amrwbenc_version || '0.1.3' }}
+  OPENH264_VERSION: ${{ github.event.inputs.openh264_version || 'v2.6.0' }}
+  VPX_VERSION: ${{ github.event.inputs.vpx_version || 'v1.16.0' }}
+  FREETYPE_VERSION: ${{ github.event.inputs.freetype_version || 'VER-2-14-2' }}
   OPUS_VERSION: ${{ github.event.inputs.opus_version || 'v1.6.1' }}
-  DAV1D_VERSION: ${{ github.event.inputs.dav1d_version || '1.5.4' }}
-  # Default is deliberately older than the current SVT-AV1 release -- see
-  # the workflow_dispatch input description and the comment above the
-  # "Clone SVT-AV1" step for why n6.1 + SVT-AV1 v2.3.0 is the
-  # known-compatible pairing this workflow was tested against.
+  LIBXML2_VERSION: ${{ github.event.inputs.libxml2_version || 'v2.15.2' }}
+  SRT_VERSION: ${{ github.event.inputs.srt_version || 'v1.5.6' }}
+  WEBP_VERSION: ${{ github.event.inputs.webp_version || 'v1.6.0' }}
+  AOM_VERSION: ${{ github.event.inputs.aom_version || 'v3.13.1' }}
   SVTAV1_VERSION: ${{ github.event.inputs.svtav1_version || 'v2.3.0' }}
+  OPENSSL_VERSION: ${{ github.event.inputs.openssl_version || 'openssl-3.5.8' }}
+  ZLIB_VERSION: ${{ github.event.inputs.zlib_version || 'v1.3.2' }}
 
 jobs:
   build:
@@ -69,35 +128,17 @@ jobs:
           - abi: arm64-v8a
             arch: aarch64
             triple: aarch64-linux-android
-            vpx_target: arm64-android-gcc
             openh264_arch: arm64
-            dav1d_cpu_family: aarch64
-            ffmpeg_extra: ""
-          - abi: armeabi-v7a
-            arch: arm
-            cpu: armv7-a
-            triple: armv7a-linux-androideabi
-            vpx_target: armv7-android-gcc
-            openh264_arch: arm
-            dav1d_cpu_family: arm
-            ffmpeg_extra: ""
-          # See the long comment on the FFmpeg configure step: x86 (32-bit)
-          # loses all hand-written x86 SIMD due to a confirmed upstream
-          # FFmpeg/lld bug, not something fixable from this workflow.
-          - abi: x86
-            arch: x86
-            triple: i686-linux-android
-            vpx_target: x86-android-gcc
-            openh264_arch: x86
-            dav1d_cpu_family: x86
-            ffmpeg_extra: "--disable-asm --enable-pic"
+            vpx_target: arm64-android-gcc
+            openssl_target: android-arm64
+            meson_cpu_family: aarch64
           - abi: x86_64
             arch: x86_64
             triple: x86_64-linux-android
-            vpx_target: x86_64-android-gcc
             openh264_arch: x86_64
-            dav1d_cpu_family: x86_64
-            ffmpeg_extra: ""
+            vpx_target: x86_64-android-gcc
+            openssl_target: android-x86_64
+            meson_cpu_family: x86_64
 
     steps:
       - name: Checkout workflow repo
@@ -130,32 +171,190 @@ jobs:
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> "$GITHUB_ENV"
           echo "DEPS_PREFIX=$PWD/deps/${{ matrix.abi }}" >> "$GITHUB_ENV"
           echo "FFMPEG_PREFIX=$PWD/android-libs/${{ matrix.abi }}" >> "$GITHUB_ENV"
+          # Every third-party lib below ends up statically linked into one
+          # of FFmpeg's own .so files, so it all has to be position
+          # independent even though it's built as a plain .a. CFLAGS/
+          # CXXFLAGS cover CMake/Meson/zlib's own configure; the autotools
+          # libs additionally get an explicit --with-pic since libtool
+          # decides PIC-or-not for static-only builds on its own and
+          # doesn't reliably take the hint from CFLAGS alone.
+          echo "CFLAGS=-fPIC" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-fPIC" >> "$GITHUB_ENV"
           mkdir -p "$PWD/deps/${{ matrix.abi }}" "$PWD/android-libs/${{ matrix.abi }}"
 
-      # ---------- OpenH264 (static, BSD-licensed H.264 codec) ----------
-      - name: Clone OpenH264
-        run: git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git openh264-src
+      # Reused by every Meson-based dependency below (currently just
+      # libxml2, but keeping this as its own step means adding another
+      # Meson-built lib later doesn't need a second copy of this file).
+      # needs_exe_wrapper=true stops Meson from trying to execute any
+      # target-arch (ARM64/x86_64-Android) binaries on the x86_64 GitHub
+      # runner during its configure-time checks.
+      - name: Generate Meson cross file for ${{ matrix.abi }}
+        run: |
+          cat > "$PWD/meson-cross-${{ matrix.abi }}.ini" <<EOF
+          [binaries]
+          c = '$CC'
+          cpp = '$CXX'
+          ar = '$AR'
+          strip = '$STRIP'
+          pkg-config = 'pkg-config'
 
-      # NOTE (x86/32-bit only): confirmed directly against
-      # build/x86-common.mk on GitHub. That file defines ASMFLAGS_PLATFORM
-      # = -DX86_32 for 32-bit x86, and only adds the PIC-safe asm define
-      # (-DX86_32_PICASM, which the .asm sources check via
-      # "%ifdef X86_32_PICASM") when the ENABLEPIC=Yes make variable is set
-      # -- it's OpenH264's own first-class, documented switch for this
-      # (see build/RELEASES: "x86 PIC assembly and build option:
-      # ENABLEPIC"). Without it, 32-bit "-f elf" NASM output defaults to
-      # absolute addressing, which fails to link into Android's mandatory
-      # PIE binaries ("relocation R_386_32 ... recompile with -fPIC").
-      # 64-bit (x86_64) doesn't need this: elf64/RIP-relative asm is
-      # PIC-safe by default (already confirmed working).
+          [host_machine]
+          system = 'android'
+          cpu_family = '${{ matrix.meson_cpu_family }}'
+          cpu = '${{ matrix.meson_cpu_family }}'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          EOF
+          echo "MESON_CROSS_FILE=$PWD/meson-cross-${{ matrix.abi }}.ini" >> "$GITHUB_ENV"
+
+      # ---------- zlib (static) ----------
+      # Built early: FreeType and libxml2 both link against it.
+      - name: Clone zlib ${{ env.ZLIB_VERSION }}
+        run: git clone --depth 1 --branch "${ZLIB_VERSION}" https://github.com/madler/zlib.git zlib-src
+
+      - name: Build zlib for ${{ matrix.abi }}
+        working-directory: zlib-src
+        run: |
+          set -e
+          ./configure --prefix="$DEPS_PREFIX" --static
+          make -j"$(nproc)"
+          make install
+
+      # ---------- OpenSSL (static) ----------
+      # Built early: SRT and FFmpeg's own --enable-openssl both need it.
+      # OpenSSL ships first-class Android Configure targets (android-arm64,
+      # android-x86_64) that derive the right clang/sysroot flags from
+      # ANDROID_NDK_ROOT + PATH, so CC/CXX from the job env are
+      # intentionally NOT passed here -- same reasoning as the CMake
+      # toolchain file below, mixing the two approaches tends to conflict.
+      - name: Clone OpenSSL ${{ env.OPENSSL_VERSION }}
+        run: git clone --depth 1 --branch "${OPENSSL_VERSION}" https://github.com/openssl/openssl.git openssl-src
+
+      - name: Build OpenSSL for ${{ matrix.abi }}
+        working-directory: openssl-src
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -e
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          ./Configure ${{ matrix.openssl_target }} \
+            -D__ANDROID_API__=${API_LEVEL} \
+            -fPIC \
+            --prefix="$DEPS_PREFIX" \
+            --openssldir="$DEPS_PREFIX" \
+            no-shared \
+            no-tests \
+            no-engine
+          make -j"$(nproc)"
+          make install_sw
+
+      # ---------- LAME (static, LGPL MP3 encoder) ----------
+      # No official git repo -- pulling the release tarball from
+      # SourceForge, same source distutils/most distros use.
+      - name: Download LAME ${{ env.LAME_VERSION }}
+        run: |
+          set -e
+          wget -q "https://downloads.sourceforge.net/project/lame/lame/${LAME_VERSION}/lame-${LAME_VERSION}.tar.gz" -O lame.tar.gz
+          mkdir lame-src
+          tar -xzf lame.tar.gz -C lame-src --strip-components=1
+
+      # FFmpeg's libmp3lame detection checks for the header/lib directly
+      # (no pkg-config file), so no .pc generation step is needed here --
+      # the --extra-cflags/--extra-ldflags on the final FFmpeg configure
+      # already point at $DEPS_PREFIX.
+      - name: Build LAME for ${{ matrix.abi }}
+        working-directory: lame-src
+        run: |
+          set -e
+          ./configure \
+            --host="${{ matrix.triple }}" \
+            --prefix="$DEPS_PREFIX" \
+            --enable-static \
+            --disable-shared \
+            --disable-frontend \
+            --with-pic \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
+          make -j"$(nproc)"
+          make install
+
+      # ---------- Speex (static, BSD speech codec) ----------
+      - name: Clone Speex ${{ env.SPEEX_VERSION }}
+        run: git clone --depth 1 --branch "${SPEEX_VERSION}" https://github.com/xiph/speex.git speex-src
+
+      - name: Build Speex for ${{ matrix.abi }}
+        working-directory: speex-src
+        run: |
+          set -e
+          ./autogen.sh
+          ./configure \
+            --host="${{ matrix.triple }}" \
+            --prefix="$DEPS_PREFIX" \
+            --enable-static \
+            --disable-shared \
+            --with-pic \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
+          make -j"$(nproc)"
+          make install
+
+      # ---------- opencore-amr (static, AMR-NB enc/dec + AMR-WB dec) ----------
+      # Also from SourceForge -- opencore-amr and vo-amrwbenc are published
+      # as tarballs, not tags, under the same project.
+      - name: Download opencore-amr ${{ env.OPENCORE_AMR_VERSION }}
+        run: |
+          set -e
+          wget -q "https://downloads.sourceforge.net/project/opencore-amr/opencore-amr/opencore-amr-${OPENCORE_AMR_VERSION}.tar.gz" -O opencore-amr.tar.gz
+          mkdir opencore-amr-src
+          tar -xzf opencore-amr.tar.gz -C opencore-amr-src --strip-components=1
+
+      - name: Build opencore-amr for ${{ matrix.abi }}
+        working-directory: opencore-amr-src
+        run: |
+          set -e
+          ./configure \
+            --host="${{ matrix.triple }}" \
+            --prefix="$DEPS_PREFIX" \
+            --enable-static \
+            --disable-shared \
+            --with-pic \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
+          make -j"$(nproc)"
+          make install
+
+      # ---------- vo-amrwbenc (static, AMR-WB encoder) ----------
+      # AMR-WB encoding is patent-encumbered separately from decoding,
+      # which is why VisualOn's encoder ships as its own project instead
+      # of being folded into opencore-amr above.
+      - name: Download vo-amrwbenc ${{ env.VO_AMRWBENC_VERSION }}
+        run: |
+          set -e
+          wget -q "https://downloads.sourceforge.net/project/opencore-amr/vo-amrwbenc/vo-amrwbenc-${VO_AMRWBENC_VERSION}.tar.gz" -O vo-amrwbenc.tar.gz
+          mkdir vo-amrwbenc-src
+          tar -xzf vo-amrwbenc.tar.gz -C vo-amrwbenc-src --strip-components=1
+
+      - name: Build vo-amrwbenc for ${{ matrix.abi }}
+        working-directory: vo-amrwbenc-src
+        run: |
+          set -e
+          ./configure \
+            --host="${{ matrix.triple }}" \
+            --prefix="$DEPS_PREFIX" \
+            --enable-static \
+            --disable-shared \
+            --with-pic \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
+          make -j"$(nproc)"
+          make install
+
+      # ---------- OpenH264 (static, BSD-licensed H.264 codec) ----------
+      - name: Clone OpenH264 ${{ env.OPENH264_VERSION }}
+        run: git clone --depth 1 --branch "${OPENH264_VERSION}" https://github.com/cisco/openh264.git openh264-src
+
       - name: Build OpenH264 for ${{ matrix.abi }}
         working-directory: openh264-src
         run: |
           set -e
-          EXTRA_MAKE_ARGS=""
-          if [ "${{ matrix.openh264_arch }}" = "x86" ]; then
-            EXTRA_MAKE_ARGS="ENABLEPIC=Yes"
-          fi
           make -j"$(nproc)" \
             OS=android \
             ARCH=${{ matrix.openh264_arch }} \
@@ -163,30 +362,14 @@ jobs:
             NDKLEVEL="${API_LEVEL}" \
             TARGET="android-${API_LEVEL}" \
             install-static \
-            PREFIX="$DEPS_PREFIX" \
-            $EXTRA_MAKE_ARGS
+            PREFIX="$DEPS_PREFIX"
 
-      # Diagnostic only: confirms the static lib actually exists and isn't
-      # empty before we trust it further down the pipeline.
-      - name: Verify OpenH264 static lib
-        run: |
-          echo "--- $DEPS_PREFIX/lib ---"
-          ls -la "$DEPS_PREFIX/lib" || true
-          echo "--- $DEPS_PREFIX/include ---"
-          find "$DEPS_PREFIX/include" -type f || true
-          file "$DEPS_PREFIX/lib/libopenh264.a" || true
-
-      # install-static only installs the header + libopenh264.a, it does not
-      # generate a pkgconfig file (that only happens via the shared/install
-      # targets), so FFmpeg's configure can't find it via pkg-config unless
-      # we write one ourselves.
-      #
-      # openh264 is a C++ library; FFmpeg's require_pkg_config link-test
-      # compiles a plain C test program and links straight against
-      # -lopenh264, so without the C++ runtime on the link line that fails
-      # and configure reports it generically as "not found using
-      # pkg-config" (same failure mode as the documented x265/libstdc++
-      # pkg-config issue). -lc++ pulls in Android NDK's libc++.
+      # install-static only installs the header + libopenh264.a, no
+      # pkgconfig file, so FFmpeg's configure can't find it via
+      # pkg-config unless we write one ourselves. OpenH264 is a C++
+      # library; -lc++ links it against the NDK's shared C++ runtime,
+      # which is why libc++_shared.so gets copied into the final package
+      # folder in the "Package" step below.
       - name: Generate openh264 pkg-config file
         run: |
           set -e
@@ -199,43 +382,32 @@ jobs:
 
           Name: openh264
           Description: OpenH264: H.264 codec library
-          Version: 2.6.0
+          Version: ${OPENH264_VERSION#v}
           Libs: -L\${libdir} -lopenh264 -lc++
           Libs.private: -lm -ldl
           Cflags: -I\${includedir}
           EOF
 
       # ---------- libvpx (static, royalty-free VP8/VP9) ----------
-      - name: Clone libvpx
-        run: git clone --depth 1 https://chromium.googlesource.com/webm/libvpx.git libvpx-src
+      - name: Clone libvpx ${{ env.VPX_VERSION }}
+        run: git clone --depth 1 --branch "${VPX_VERSION}" https://chromium.googlesource.com/webm/libvpx.git libvpx-src
 
-      # Two separate, arch-specific workarounds:
-      #
-      # 1. x86 / x86_64: the job-level AS env var (set above) points at the
-      #    NDK's clang, correct for FFmpeg but wrong for libvpx. libvpx's
-      #    configure.sh only auto-detects nasm/yasm when AS is unset; since
-      #    GITHUB_ENV vars persist across every step in the job, AS arrives
-      #    here already "set" to clang, which then gets called with
-      #    NASM-style flags (-f elf64 ...) it doesn't understand.
-      #
-      # 2. armeabi-v7a: hand-written NEON assembly (*_neon_asm.asm.S) is
-      #    assembled by calling $(AS) directly with raw GNU-as flags
-      #    (-march=armv7-a, --defsym ...). Modern NDKs (r26d here) no longer
-      #    ship a standalone binutils 'as' that understands those flags, and
-      #    clang's integrated assembler rejects them too since they aren't
-      #    passed through -Wa,. --disable-neon-asm falls back to NEON C
-      #    intrinsics instead.
+      # The job-level AS env var points at NDK clang, correct for FFmpeg
+      # but wrong for libvpx: libvpx's configure.sh only auto-detects
+      # nasm/yasm when AS is unset, and since GITHUB_ENV vars persist
+      # across every step, AS arrives here already "set", so it needs an
+      # explicit unset + --as=nasm override. Both remaining ABIs are
+      # x86_64/aarch64 -- neither needs the old armeabi-v7a
+      # --disable-neon-asm workaround, arm64's NEON asm files use clang-
+      # compatible syntax already.
       - name: Build libvpx for ${{ matrix.abi }}
         working-directory: libvpx-src
         run: |
           set -e
           VPX_EXTRA_FLAGS=""
-          if [ "${{ matrix.arch }}" = "x86" ] || [ "${{ matrix.arch }}" = "x86_64" ]; then
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
             unset AS
             VPX_EXTRA_FLAGS="--as=nasm"
-          fi
-          if [ "${{ matrix.abi }}" = "armeabi-v7a" ]; then
-            VPX_EXTRA_FLAGS="$VPX_EXTRA_FLAGS --disable-neon-asm"
           fi
           ./configure \
             --target=${{ matrix.vpx_target }} \
@@ -251,18 +423,38 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      # ---------- FreeType (static, font rendering for drawtext) ----------
+      # harfbuzz/bzip2/png stay off to avoid pulling in more dependency
+      # chains than the drawtext filter actually needs; zlib (built
+      # above) is linked in for the handful of compressed font formats
+      # that use it.
+      - name: Clone FreeType ${{ env.FREETYPE_VERSION }}
+        run: git clone --depth 1 --branch "${FREETYPE_VERSION}" https://github.com/freetype/freetype.git freetype-src
+
+      - name: Build FreeType for ${{ matrix.abi }}
+        working-directory: freetype-src
+        run: |
+          set -e
+          ./autogen.sh
+          PKG_CONFIG_LIBDIR="$DEPS_PREFIX/lib/pkgconfig" \
+          ./configure \
+            --host="${{ matrix.triple }}" \
+            --prefix="$DEPS_PREFIX" \
+            --enable-static \
+            --disable-shared \
+            --with-pic \
+            --with-harfbuzz=no \
+            --with-bzip2=no \
+            --with-png=no \
+            --with-zlib=yes \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
+          make -j"$(nproc)"
+          make install
+
       # ---------- Opus (static, royalty-free speech/audio codec) ----------
-      - name: Clone Opus
+      - name: Clone Opus ${{ env.OPUS_VERSION }}
         run: git clone --depth 1 --branch "${OPUS_VERSION}" https://github.com/xiph/opus.git opus-src
 
-      # Plain autotools project, no asm/PIC gotchas like the video codecs
-      # above. --host is just the generic triple (used by config.sub for
-      # feature detection); CC/AR/RANLIB/STRIP are pinned explicitly to the
-      # NDK toolchain set up earlier so the actual compiler used is never in
-      # question regardless of what --host resolves to.
-      # autogen.sh is required because we're building from a git checkout
-      # (no bundled ./configure yet); autoconf/automake/libtool are already
-      # installed above.
       - name: Build Opus for ${{ matrix.abi }}
         working-directory: opus-src
         run: |
@@ -275,121 +467,179 @@ jobs:
             --disable-shared \
             --disable-doc \
             --disable-extra-programs \
+            --with-pic \
             CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP"
           make -j"$(nproc)"
           make install
 
-      # `make install` generates $DEPS_PREFIX/lib/pkgconfig/opus.pc
-      # automatically, so no hand-written .pc file is needed here (unlike
-      # OpenH264 above).
+      # ---------- libxml2 (static, used by the dash/smoothstreaming demuxers) ----------
+      # Built with Meson rather than autotools: libxml2 supports both, but
+      # Meson is the build system upstream is actively steering people
+      # toward, so it's the safer long-term choice for a version that's
+      # user-overridable to anything.
+      - name: Clone libxml2 ${{ env.LIBXML2_VERSION }}
+        run: git clone --depth 1 --branch "${LIBXML2_VERSION}" https://github.com/GNOME/libxml2.git libxml2-src
 
-      # ---------- dav1d (static, fast AV1 decoder) ----------
-      # Optional: toggle with the enable_dav1d workflow_dispatch input.
-      - name: Clone dav1d
-        if: env.ENABLE_DAV1D == 'true'
-        run: git clone --depth 1 --branch "${DAV1D_VERSION}" https://code.videolan.org/videolan/dav1d.git dav1d-src
-
-      # dav1d uses Meson, not autotools, so it needs its own cross file
-      # rather than a --host triple. needs_exe_wrapper=true stops Meson
-      # from trying to execute any target-arch (ARM/x86-Android) binaries
-      # on the x86_64 GitHub runner during its configure-time checks.
-      - name: Generate meson cross file for dav1d (${{ matrix.abi }})
-        if: env.ENABLE_DAV1D == 'true'
-        run: |
-          cat > "$PWD/dav1d-cross-${{ matrix.abi }}.ini" <<EOF
-          [binaries]
-          c = '$CC'
-          cpp = '$CXX'
-          ar = '$AR'
-          strip = '$STRIP'
-          pkg-config = 'pkg-config'
-
-          [host_machine]
-          system = 'android'
-          cpu_family = '${{ matrix.dav1d_cpu_family }}'
-          cpu = '${{ matrix.dav1d_cpu_family }}'
-          endian = 'little'
-
-          [properties]
-          needs_exe_wrapper = true
-          EOF
-
-      # enable_asm stays on for all four ABIs: unlike the FFmpeg x86 case
-      # below, dav1d's own x86 asm is written with PIC in mind from the
-      # start (it ships on 32-bit x86 Android today via apps like
-      # ExoPlayer). If this ever regresses on a future dav1d/NDK
-      # combination, the fix is the same shape as the FFmpeg one: pass
-      # -Denable_asm=false for the x86 ABI only.
-      - name: Build dav1d for ${{ matrix.abi }}
-        if: env.ENABLE_DAV1D == 'true'
-        working-directory: dav1d-src
+      - name: Build libxml2 for ${{ matrix.abi }}
+        working-directory: libxml2-src
         run: |
           set -e
           meson setup build \
-            --cross-file="$PWD/../dav1d-cross-${{ matrix.abi }}.ini" \
+            --cross-file="$MESON_CROSS_FILE" \
             --prefix="$DEPS_PREFIX" \
             --libdir=lib \
             --default-library=static \
             --buildtype=release \
-            -Denable_asm=true \
-            -Denable_tools=false \
-            -Denable_examples=false \
-            -Denable_tests=false
+            -Dpython=disabled \
+            -Dhttp=disabled \
+            -Dlzma=disabled \
+            -Dzlib=enabled \
+            -Dtests=disabled \
+            -Dexpat=disabled
           ninja -C build
           ninja -C build install
 
-      - name: Upload dav1d meson log on failure
-        if: failure() && env.ENABLE_DAV1D == 'true'
+      - name: Upload libxml2 meson log on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: dav1d-meson-log-${{ matrix.abi }}
-          path: dav1d-src/build/meson-logs/meson-log.txt
+          name: libxml2-meson-log-${{ matrix.abi }}
+          path: libxml2-src/build/meson-logs/meson-log.txt
+          if-no-files-found: ignore
+
+      # ---------- SRT (static, Secure Reliable Transport) ----------
+      # Needs OpenSSL for its encryption; USE_ENCLIB + the OPENSSL_*
+      # variables point it at the static libcrypto/libssl built above
+      # rather than letting CMake's FindOpenSSL search the host system.
+      - name: Clone SRT ${{ env.SRT_VERSION }}
+        run: git clone --depth 1 --branch "${SRT_VERSION}" https://github.com/Haivision/srt.git srt-src
+
+      - name: Build SRT for ${{ matrix.abi }}
+        working-directory: srt-src
+        run: |
+          set -e
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-${API_LEVEL} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_PREFIX_PATH="$DEPS_PREFIX" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_STATIC=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_APPS=OFF \
+            -DENABLE_UNITTESTS=OFF \
+            -DUSE_ENCLIB=openssl \
+            -DOPENSSL_ROOT_DIR="$DEPS_PREFIX" \
+            -DOPENSSL_INCLUDE_DIR="$DEPS_PREFIX/include" \
+            -DOPENSSL_CRYPTO_LIBRARY="$DEPS_PREFIX/lib/libcrypto.a" \
+            -DOPENSSL_SSL_LIBRARY="$DEPS_PREFIX/lib/libssl.a"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Upload SRT CMake log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: srt-cmake-log-${{ matrix.abi }}
+          path: srt-src/build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+
+      # ---------- WebP (static, image codec) ----------
+      # WEBP_BUILD_WEBPMUX=ON is required for libwebpmux.pc, which is what
+      # FFmpeg's --enable-libwebp needs for animated WebP muxing; the
+      # standalone CLI tools (cwebp, dwebp, ...) are all switched off
+      # since only the libraries are needed here.
+      - name: Clone libwebp ${{ env.WEBP_VERSION }}
+        run: git clone --depth 1 --branch "${WEBP_VERSION}" https://github.com/webmproject/libwebp.git webp-src
+
+      - name: Build libwebp for ${{ matrix.abi }}
+        working-directory: webp-src
+        run: |
+          set -e
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-${API_LEVEL} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWEBP_BUILD_ANIM_UTILS=OFF \
+            -DWEBP_BUILD_CWEBP=OFF \
+            -DWEBP_BUILD_DWEBP=OFF \
+            -DWEBP_BUILD_GIF2WEBP=OFF \
+            -DWEBP_BUILD_IMG2WEBP=OFF \
+            -DWEBP_BUILD_VWEBP=OFF \
+            -DWEBP_BUILD_WEBPINFO=OFF \
+            -DWEBP_BUILD_WEBPMUX=ON \
+            -DWEBP_BUILD_EXTRAS=OFF
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      # ---------- libaom (static, AV1 encode + decode, replaces dav1d) ----------
+      - name: Clone libaom ${{ env.AOM_VERSION }}
+        run: git clone --depth 1 --branch "${AOM_VERSION}" https://aomedia.googlesource.com/aom aom-src
+
+      - name: Build libaom for ${{ matrix.abi }}
+        working-directory: aom-src
+        run: |
+          set -e
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-${API_LEVEL} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DENABLE_DOCS=OFF \
+            -DENABLE_TESTDATA=OFF \
+            -DENABLE_TOOLS=OFF \
+            -DCONFIG_RUNTIME_CPU_DETECT=1
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Upload libaom CMake log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aom-cmake-log-${{ matrix.abi }}
+          path: aom-src/build/CMakeFiles/CMakeError.log
           if-no-files-found: ignore
 
       # ---------- SVT-AV1 (static, fast AV1 encoder) ----------
-      # Optional: toggle with the enable_svtav1 workflow_dispatch input.
       # Version: svtav1_version workflow_dispatch input (default v2.3.0).
       #
-      # THIS VERSION IS PINNED DELIBERATELY, NOT ARBITRARILY -- SVT-AV1's
-      # public C API is not stable across majors and FFmpeg's libsvtav1.c
-      # wrapper is compiled against whatever struct/function shape existed
-      # at the time each FFmpeg version was cut:
+      # THIS PAIRING IS DELIBERATE, NOT ARBITRARY -- SVT-AV1's public C API
+      # is not stable across majors, and FFmpeg's libsvtav1.c wrapper is
+      # compiled against whatever struct/function shape existed at the
+      # time each FFmpeg version was cut:
       #
       #   1. SVT-AV1 3.0.0 changed svt_av1_enc_init_handle() from 3 args to
-      #      2 (commit 988e930c on their side). FFmpeg only learned to
-      #      detect and handle both shapes in commit d1ed5c06e (22 Feb
-      #      2025), which was backported into the release/6.1 and
-      #      release/4.4 branches (i.e. tags 6.1.2+), but NOT into the
-      #      frozen "n6.1" tag this workflow defaults to -- n6.1 predates
-      #      the fix entirely and only knows the old 3-arg signature.
-      #   2. SVT-AV1 4.0.0 then removed the enable_adaptive_quantization
-      #      field from EbSvtAv1EncConfiguration. FFmpeg didn't gain a
-      #      workaround for that until commit a5d4c398b4 (~29 Jan 2026),
-      #      which landed in FFmpeg 8.1 -- still not in n6.1 or 6.1.x.
+      #      2 (commit 988e930c). FFmpeg only learned to handle both
+      #      shapes in commit d1ed5c06e (22 Feb 2025), backported into the
+      #      release/6.1 and release/4.4 branches (tags 6.1.2+), but NOT
+      #      into the frozen "n6.1" tag this workflow defaults to.
+      #   2. SVT-AV1 4.0.0 then removed enable_adaptive_quantization from
+      #      EbSvtAv1EncConfiguration. FFmpeg's workaround (commit
+      #      a5d4c398b4) only landed in FFmpeg 8.1 -- still not in n6.1.
       #
-      # Building SVT-AV1 4.2.0 against FFmpeg n6.1 hits both of the above
-      # and fails with "no member named 'enable_adaptive_quantization'"
-      # and "too many arguments to function call" on svt_av1_enc_init_handle.
-      # v2.3.0 predates both API breaks, so it links cleanly against n6.1's
-      # wrapper as-is.
-      #
-      # If you bump ffmpeg_version to n8.1 or later (or any branch/tag
-      # containing both commits above), you can also bump svtav1_version
-      # to a current release (e.g. v4.2.0) -- just change both inputs
+      # v2.3.0 predates both API breaks, so it links cleanly against
+      # n6.1's wrapper as-is. If you bump ffmpeg_version to n8.1+ (or any
+      # branch/tag containing both commits above), you can also bump
+      # svtav1_version to a current release -- change both inputs
       # together on the same run, they are not independent.
-      - name: Clone SVT-AV1
-        if: env.ENABLE_SVTAV1 == 'true'
+      - name: Clone SVT-AV1 ${{ env.SVTAV1_VERSION }}
         run: git clone --depth 1 --branch "${SVTAV1_VERSION}" https://gitlab.com/AOMediaCodec/SVT-AV1.git svtav1-src
 
-      # Uses CMake with the NDK's own android.toolchain.cmake, which is the
-      # documented/supported way to cross-compile CMake projects for
-      # Android -- it derives the correct clang target triple, sysroot and
-      # API-level flags from ANDROID_ABI/ANDROID_PLATFORM, so CC/CXX are
-      # intentionally left unset here rather than reusing the job-level
-      # ones (mixing the two approaches is more likely to conflict than
-      # help).
       - name: Build SVT-AV1 for ${{ matrix.abi }}
-        if: env.ENABLE_SVTAV1 == 'true'
         working-directory: svtav1-src
         run: |
           set -e
@@ -400,6 +650,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
             -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUILD_APPS=OFF \
             -DBUILD_DEC=ON \
@@ -408,106 +659,45 @@ jobs:
           cmake --build build -j"$(nproc)"
           cmake --install build
 
-      # `cmake --install` generates SvtAv1Enc.pc / SvtAv1Dec.pc under
-      # $DEPS_PREFIX/lib/pkgconfig -- exactly the names FFmpeg's configure
-      # probes for with --enable-libsvtav1, so no manual .pc file needed.
-      #
-      # Caveat: SVT-AV1's x86 SIMD is NASM-based like OpenH264/FFmpeg's
-      # above, and 32-bit x86 Android is the one ABI where this class of
-      # lld/PIC bug has repeatedly turned up across this whole toolchain.
-      # It isn't reproduced here, so nothing is disabled pre-emptively --
-      # but if the x86 leg fails specifically in SVT-AV1's own asm, that's
-      # the first thing to suspect (see the CMakeError.log upload below).
-
       - name: Upload SVT-AV1 CMake log on failure
-        if: failure() && env.ENABLE_SVTAV1 == 'true'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: svtav1-cmake-log-${{ matrix.abi }}
           path: svtav1-src/build/CMakeFiles/CMakeError.log
           if-no-files-found: ignore
 
-      # ---------- FFmpeg (shared, statically links the above) ----------
+      # ---------- FFmpeg (shared libs) + ffprobe ----------
       - name: Clone FFmpeg source
         run: |
           git clone --depth 1 --branch "${FFMPEG_VERSION}" \
             https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
 
+      # --enable-shared --disable-static: this build produces
+      # libavcodec.so/libavformat.so/etc. instead of the .a archives from
+      # a normal static build, and the ffmpeg/ffprobe CLI tools link
+      # against those .so's dynamically rather than absorbing the code
+      # directly. -Wl,-rpath,$ORIGIN (note the escaped $ -- it must reach
+      # the linker literally, not get expanded by this shell) tells every
+      # binary and .so produced here to look for its dependencies in
+      # whatever directory it itself lives in, which is what makes the
+      # flat single-folder package in the next step work without setting
+      # LD_LIBRARY_PATH: ffmpeg, ffprobe, and all the libav*.so files
+      # only ever need to sit next to each other, wherever that is.
+      #
+      # --pkg-config-flags="--static" makes pkg-config report each
+      # dependency's full private link chain (e.g. SRT pulling in
+      # -lcrypto -lssl), which matters because every one of those
+      # dependencies is itself a static archive.
       - name: Configure and build FFmpeg + ffprobe for ${{ matrix.abi }}
         working-directory: ffmpeg-src
         run: |
           set -e
-          EXTRA_FLAGS=""
-          if [ "${{ matrix.arch }}" = "arm" ]; then
-            EXTRA_FLAGS="--cpu=${{ matrix.cpu }}"
-          fi
-
-          # Per-ABI extra configure flags from the matrix.
-          #
-          # x86 (32-bit) only: --disable-asm --enable-pic
-          #
-          # This is a confirmed, currently-unresolved upstream FFmpeg bug,
-          # not something fixable from build flags on our end. Verified
-          # against a real, merged OpenEmbedded patch that hit the exact
-          # same failure independently -- same file, same relocation type,
-          # same linker (i686 target + lld):
-          #   "ld.lld: error: relocation R_386_32 cannot be used against
-          #    local symbol; recompile with -fPIC"
-          #   >>> defined in libavutil/x86/tx_float.o
-          # Their finding, from actually bisecting it: this only reproduces
-          # with the lld linker (which is what Android NDK's clang uses by
-          # default -- confirmed via GNU ld not showing the same error), and
-          # the cause is that libavutil/x86/tx_float.asm's PIC handling is
-          # genuinely incomplete for 32-bit x86, not a flag/config problem.
-          # We verified --enable-pic *is* correctly wired through on our
-          # end (config.log shows "pic='yes'" and FFmpeg's own nasm probes
-          # already run with "-f elf32 -DPIC"), which rules out a config
-          # mistake and points squarely at the asm source itself.
-          #
-          # There is no known working combination of flags that keeps x86
-          # SIMD AND links successfully under lld + PIC on 32-bit x86, so
-          # --disable-asm turns off all hand-written x86 SIMD (inline and
-          # external NASM) for this ABI only, falling back to plain C.
-          # --enable-pic is kept regardless: it's still required for the
-          # C-compiled portions to link correctly into a PIE .so.
-          #
-          # Practical impact: slower on the legacy 32-bit x86 Android ABI
-          # only (negligible real-device footprint today). arm64-v8a,
-          # armeabi-v7a, and x86_64 are all unaffected and keep full SIMD.
-          EXTRA_FLAGS="$EXTRA_FLAGS ${{ matrix.ffmpeg_extra }}"
-
-          # libopus is always on. dav1d/svtav1 are gated on the same
-          # workflow inputs used to decide whether to build them above, so
-          # this can never try to --enable- a library that wasn't built.
-          EXTRA_FLAGS="$EXTRA_FLAGS --enable-libopus"
-          if [ "${ENABLE_DAV1D}" = "true" ]; then
-            EXTRA_FLAGS="$EXTRA_FLAGS --enable-libdav1d"
-          fi
-          if [ "${ENABLE_SVTAV1}" = "true" ]; then
-            EXTRA_FLAGS="$EXTRA_FLAGS --enable-libsvtav1"
-          fi
-
-          # Building both the `ffmpeg` and `ffprobe` CLI executables, not
-          # the jniLibs .so set: FFmpeg's own libs (avutil/avcodec/...) and
-          # every codec dep built above are static (.a), and get linked
-          # straight into the two standalone binaries. The only things
-          # still linked dynamically are bionic's own libc/libm/libdl/
-          # liblog, guaranteed present on every Android device -- that's
-          # what makes copying the two files over enough to run, no other
-          # files or LD_LIBRARY_PATH juggling needed on-device.
-          #
-          # ffprobe is now REQUIRED downstream: FFmpegManager (the consumer
-          # of this build's output) refuses to use an install directory
-          # unless it contains both an ffmpeg and an ffprobe binary, so
-          # --disable-ffprobe must NOT be passed. ffplay stays disabled
-          # since it needs SDL2 (not built here) and nothing downstream
-          # uses it -- so exactly two programs come out of `make install`.
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
           ./configure \
             --prefix="$FFMPEG_PREFIX" \
             --target-os=android \
             --arch="${{ matrix.arch }}" \
-            $EXTRA_FLAGS \
             --sysroot="$TOOLCHAIN/sysroot" \
             --cc="$CC" \
             --cxx="$CXX" \
@@ -515,8 +705,9 @@ jobs:
             --enable-cross-compile \
             --enable-jni \
             --enable-mediacodec \
-            --disable-shared \
-            --enable-static \
+            --enable-shared \
+            --disable-static \
+            --enable-pic \
             --disable-doc \
             --disable-ffplay \
             --disable-symver \
@@ -524,50 +715,31 @@ jobs:
             --enable-small \
             --enable-optimizations \
             --enable-version3 \
+            --enable-openssl \
+            --enable-zlib \
+            --enable-libmp3lame \
+            --enable-libspeex \
+            --enable-libopencore-amrnb \
+            --enable-libopencore-amrwb \
+            --enable-libvo-amrwbenc \
             --enable-libopenh264 \
             --enable-libvpx \
-            --enable-encoder=ffv1 --enable-decoder=ffv1 \
-            --enable-encoder=flac --enable-decoder=flac \
+            --enable-libfreetype \
+            --enable-libopus \
+            --enable-libxml2 \
+            --enable-libsrt \
+            --enable-libwebp \
+            --enable-libaom \
+            --enable-libsvtav1 \
             --extra-cflags="-I$DEPS_PREFIX/include" \
-            --extra-ldflags="-L$DEPS_PREFIX/lib" \
+            --extra-ldflags="-L$DEPS_PREFIX/lib -Wl,-rpath,\$ORIGIN" \
             --pkg-config-flags="--static" \
             --pkg-config="$(which pkg-config)"
-          # Note: FFV1 and FLAC are FFmpeg-native (no external library, so
-          # nothing to build above) and were already compiled in before
-          # this change -- this configure script never uses
-          # --disable-everything/--disable-encoders/--disable-decoders, so
-          # every built-in codec, including these two, was always enabled
-          # by default. The two --enable-*=ffv1/flac pairs above are added
-          # purely to make that support explicit and to make the build
-          # resilient if --disable-everything is ever introduced later.
           make -j"$(nproc)"
           make install
 
           echo "Build output for ${{ matrix.abi }}:"
           find "$FFMPEG_PREFIX" -maxdepth 2
-
-      # `make install` produces $FFMPEG_PREFIX/bin/ffmpeg and .../ffprobe
-      # with those exact bare names -- no extension, since this is a
-      # non-Windows target. That's the same name shape FFmpegManager's
-      # findExtractedFile() looks for on disk after extraction
-      # (OS_TYPE.executableName("ffmpeg") / ("ffprobe")), so the binaries
-      # are packaged as-is below, deliberately NOT renamed. Only the
-      # *archive* gets the descriptive "FFmpeg-android-<abi>" name;
-      # findExtractedFile() walks the whole extracted tree by filename, so
-      # it doesn't care whether the two binaries sit at the zip root or in
-      # a subfolder -- zip -j (junk paths) is used purely to keep the
-      # archive flat and simple, not because a specific layout is required.
-      - name: Package ffmpeg + ffprobe into archive for ${{ matrix.abi }}
-        run: |
-          set -e
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          chmod +x "$FFMPEG_PREFIX/bin/ffmpeg" "$FFMPEG_PREFIX/bin/ffprobe"
-
-          ARCHIVE="$GITHUB_WORKSPACE/dist/FFmpeg-android-${{ matrix.abi }}.zip"
-          ( cd "$FFMPEG_PREFIX/bin" && zip -j "$ARCHIVE" ffmpeg ffprobe )
-
-          echo "Archive contents for ${{ matrix.abi }}:"
-          unzip -l "$ARCHIVE"
 
       - name: Upload config.log on failure
         if: failure()
@@ -575,6 +747,46 @@ jobs:
         with:
           name: ffmpeg-config-log-${{ matrix.abi }}
           path: ffmpeg-src/ffbuild/config.log
+
+      # ---------- Package: one flat folder per ABI ----------
+      # Everything ffmpeg/ffprobe need at runtime -- the two executables,
+      # every libav*.so FFmpeg just produced, and libc++_shared.so from
+      # the NDK sysroot -- goes into the same directory and gets zipped
+      # flat (zip -j). libc++_shared.so specifically: OpenH264 (and
+      # potentially SRT, depending on how their build resolved the C++
+      # STL choice) link against the NDK's shared C++ runtime rather than
+      # a static copy, and unlike a normal Android app there's no
+      # guarantee that library is reachable when these binaries are
+      # exec()'d directly outside of an APK -- so it travels with the zip
+      # like any other dependency.
+      #
+      # `cp -L` dereferences the .so version symlinks FFmpeg's own
+      # install step creates (libavcodec.so -> libavcodec.so.60 -> the
+      # real file) into plain regular files. This means both the
+      # SONAME-versioned name (libavcodec.so.60, what the dynamic linker
+      # actually looks for via each binary's DT_NEEDED entries) and the
+      # bare name exist as real files in the package -- simpler and more
+      # robust inside a zip than trying to preserve symlinks.
+      - name: Package ffmpeg + ffprobe + shared libs for ${{ matrix.abi }}
+        run: |
+          set -e
+          PACKAGE_DIR="$GITHUB_WORKSPACE/package/${{ matrix.abi }}"
+          mkdir -p "$PACKAGE_DIR"
+
+          cp "$FFMPEG_PREFIX/bin/ffmpeg" "$PACKAGE_DIR/"
+          cp "$FFMPEG_PREFIX/bin/ffprobe" "$PACKAGE_DIR/"
+          cp -L "$FFMPEG_PREFIX"/lib/*.so* "$PACKAGE_DIR/"
+          cp "$TOOLCHAIN/sysroot/usr/lib/${{ matrix.triple }}/libc++_shared.so" "$PACKAGE_DIR/"
+
+          chmod +x "$PACKAGE_DIR/ffmpeg" "$PACKAGE_DIR/ffprobe"
+          "$STRIP" "$PACKAGE_DIR"/*.so* || true
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          ARCHIVE="$GITHUB_WORKSPACE/dist/FFmpeg-android-${{ matrix.abi }}.zip"
+          ( cd "$PACKAGE_DIR" && zip -j "$ARCHIVE" * )
+
+          echo "Archive contents for ${{ matrix.abi }}:"
+          unzip -l "$ARCHIVE"
 
       - name: Upload archive for ${{ matrix.abi }}
         uses: actions/upload-artifact@v4
@@ -593,30 +805,36 @@ jobs:
           {
             echo "### FFmpeg + ffprobe for Android -- build summary"
             echo ""
-            echo "Output: one \`FFmpeg-android-<abi>.zip\` per ABI, each containing"
-            echo "an \`ffmpeg\` and an \`ffprobe\` binary (bare names, no renaming)."
+            echo "Output: one \`FFmpeg-android-<abi>.zip\` per ABI. Each zip is a"
+            echo "single flat folder containing \`ffmpeg\`, \`ffprobe\`,"
+            echo "\`libc++_shared.so\`, and every FFmpeg shared library"
+            echo "(\`libavcodec.so\`, \`libavformat.so\`, \`libavutil.so\`,"
+            echo "\`libavfilter.so\`, \`libavdevice.so\`, \`libswscale.so\`,"
+            echo "\`libswresample.so\`). Every codec below is statically linked"
+            echo "into those libraries, not shipped as its own .so."
             echo ""
-            echo "| Component | Version | Status |"
-            echo "|---|---|---|"
-            echo "| FFmpeg | \`${FFMPEG_VERSION}\` | built |"
-            echo "| Android NDK | \`${NDK_VERSION}\` | (min API ${API_LEVEL}) |"
-            echo "| OpenH264 | \`v2.6.0\` | built |"
-            echo "| libvpx | *(unpinned -- latest master at build time)* | built |"
-            echo "| Opus | \`${OPUS_VERSION}\` | built |"
-            if [ "${ENABLE_DAV1D}" = "true" ]; then
-              echo "| dav1d | \`${DAV1D_VERSION}\` | built |"
-            else
-              echo "| dav1d | \`${DAV1D_VERSION}\` | skipped (enable_dav1d=false) |"
-            fi
-            if [ "${ENABLE_SVTAV1}" = "true" ]; then
-              echo "| SVT-AV1 | \`${SVTAV1_VERSION}\` | built |"
-            else
-              echo "| SVT-AV1 | \`${SVTAV1_VERSION}\` | skipped (enable_svtav1=false) |"
-            fi
-            echo "| FFV1 | native (FFmpeg-internal) | always on |"
-            echo "| FLAC | native (FFmpeg-internal) | always on |"
+            echo "| Component | Version |"
+            echo "|---|---|"
+            echo "| FFmpeg | \`${FFMPEG_VERSION}\` |"
+            echo "| Android NDK | \`${NDK_VERSION}\` (min API ${API_LEVEL}) |"
+            echo "| LAME (mp3) | \`${LAME_VERSION}\` |"
+            echo "| Speex | \`${SPEEX_VERSION}\` |"
+            echo "| opencore-amr (NB+WB) | \`${OPENCORE_AMR_VERSION}\` |"
+            echo "| vo-amrwbenc | \`${VO_AMRWBENC_VERSION}\` |"
+            echo "| OpenH264 | \`${OPENH264_VERSION}\` |"
+            echo "| libvpx | \`${VPX_VERSION}\` |"
+            echo "| FreeType | \`${FREETYPE_VERSION}\` |"
+            echo "| Opus | \`${OPUS_VERSION}\` |"
+            echo "| libxml2 | \`${LIBXML2_VERSION}\` |"
+            echo "| SRT | \`${SRT_VERSION}\` |"
+            echo "| libwebp | \`${WEBP_VERSION}\` |"
+            echo "| libaom (AV1) | \`${AOM_VERSION}\` |"
+            echo "| SVT-AV1 | \`${SVTAV1_VERSION}\` |"
+            echo "| OpenSSL | \`${OPENSSL_VERSION}\` |"
+            echo "| zlib | \`${ZLIB_VERSION}\` |"
+            echo "| MediaCodec (Android HW) | native, \`--enable-mediacodec --enable-jni\` |"
             echo ""
-            echo "ABIs: arm64-v8a, armeabi-v7a, x86, x86_64"
+            echo "ABIs: arm64-v8a, x86_64"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Download all artifacts
