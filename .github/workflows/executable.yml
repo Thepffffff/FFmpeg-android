@@ -736,6 +736,21 @@ jobs:
       # LD_LIBRARY_PATH: ffmpeg, ffprobe, and all the libav*.so files
       # only ever need to sit next to each other, wherever that is.
       #
+      # NOTE ON THE TRIPLE BACKSLASH: FFmpeg's own configure script
+      # reassembles --extra-ldflags internally via a shell `eval`, which
+      # amounts to a *second* round of shell parsing on top of this
+      # step's own. A single "\$ORIGIN" here (one backslash) survives
+      # this step's parsing fine and reaches configure's argv as literal
+      # "$ORIGIN" -- but configure's internal eval then parses THAT as
+      # real shell syntax, treats $ORIGIN as an (unset) shell variable,
+      # and silently collapses it to an empty string, leaving a broken
+      # "-Wl,-rpath," with no value. That empty rpath is enough to break
+      # even configure's own "can this compiler link anything" sanity
+      # check under the NDK's ld.lld, well before any real feature
+      # detection starts. Three backslashes survive both parsing passes
+      # and land on the compiler command line as literal $ORIGIN, which
+      # is what the dynamic linker needs to see at runtime.
+      #
       # --pkg-config-flags="--static" makes pkg-config report each
       # dependency's full private link chain (e.g. SRT pulling in
       # -lcrypto -lssl), which matters because every one of those
@@ -783,7 +798,7 @@ jobs:
             --enable-libaom \
             --enable-libsvtav1 \
             --extra-cflags="-I$DEPS_PREFIX/include" \
-            --extra-ldflags="-L$DEPS_PREFIX/lib -Wl,-rpath,\$ORIGIN" \
+            --extra-ldflags="-L$DEPS_PREFIX/lib -Wl,-rpath,\\\$ORIGIN" \
             --pkg-config-flags="--static" \
             --pkg-config="$(which pkg-config)"
           make -j"$(nproc)"
