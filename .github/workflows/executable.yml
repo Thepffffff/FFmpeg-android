@@ -494,7 +494,31 @@ jobs:
           # three makes meson bail out with "ERROR: Unknown options"
           # before it configures anything, which is what was happening
           # here. Stick to options meson_options.txt actually defines;
-          # "python", "http", and "zlib" below are all valid.
+          # "python", "http", "zlib", and "iconv" below are all valid.
+          #
+          # iconv: "iconv" is an "auto" feature that's allowed (i.e.
+          # searched for and required) unless explicitly turned off --
+          # meson.build calls `dependency('iconv')` with no
+          # required: false, so leaving it on its default fails the
+          # configure step outright on this cross toolchain, where
+          # there's no iconv.pc and no standalone libiconv (the NDK's
+          # Bionic libc doesn't ship iconv(3) the way glibc does).
+          # Disabling it is safe here: none of what FFmpeg needs from
+          # libxml2 (the dash/smoothstreaming demuxers parsing XML
+          # manifests) requires character-set transcoding, and the
+          # `iso8859x` option -- which covers libxml2's built-in
+          # fallback tables and is left at its default of enabled --
+          # still gives it non-UTF-8 handling without iconv.
+          #
+          # PKG_CONFIG_LIBDIR (as opposed to PKG_CONFIG_PATH, which only
+          # adds to the search path rather than replacing it) restricts
+          # pkg-config to just $DEPS_PREFIX/lib/pkgconfig, so the
+          # `dependency('zlib')` call below resolves to the static
+          # aarch64/x86_64-Android zlib built earlier in this job and
+          # not to whatever zlib.pc the ubuntu-latest runner happens to
+          # have on its own default search path -- the same reasoning
+          # the FreeType step above already applies.
+          PKG_CONFIG_LIBDIR="$DEPS_PREFIX/lib/pkgconfig" \
           meson setup build \
             --cross-file="$MESON_CROSS_FILE" \
             --prefix="$DEPS_PREFIX" \
@@ -503,7 +527,8 @@ jobs:
             --buildtype=release \
             -Dpython=disabled \
             -Dhttp=disabled \
-            -Dzlib=enabled
+            -Dzlib=enabled \
+            -Diconv=disabled
           ninja -C build
           ninja -C build install
 
