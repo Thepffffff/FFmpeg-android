@@ -183,7 +183,7 @@ jobs:
           mkdir -p "$PWD/deps/${{ matrix.abi }}" "$PWD/android-libs/${{ matrix.abi }}"
 
       # Reused by every Meson-based dependency below (currently just
-      # libxml2, but keeping this as its own step means adding another
+      # libxml2, but keeping this as its own file means adding another
       # Meson-built lib later doesn't need a second copy of this file).
       # needs_exe_wrapper=true stops Meson from trying to execute any
       # target-arch (ARM64/x86_64-Android) binaries on the x86_64 GitHub
@@ -484,6 +484,17 @@ jobs:
         working-directory: libxml2-src
         run: |
           set -e
+          # libxml2's meson_options.txt has no "expat" option -- libxml2
+          # never depends on expat at all, that's a separate, unrelated
+          # XML library. As of the 2.15 series there's also no "lzma"
+          # option (liblzma support was dropped) or "tests" option (the
+          # test binaries under meson.build's `checks` loop are already
+          # build_by_default: false, so `ninja -C build` below won't
+          # build them anyway -- nothing to disable). Passing any of the
+          # three makes meson bail out with "ERROR: Unknown options"
+          # before it configures anything, which is what was happening
+          # here. Stick to options meson_options.txt actually defines;
+          # "python", "http", and "zlib" below are all valid.
           meson setup build \
             --cross-file="$MESON_CROSS_FILE" \
             --prefix="$DEPS_PREFIX" \
@@ -492,10 +503,7 @@ jobs:
             --buildtype=release \
             -Dpython=disabled \
             -Dhttp=disabled \
-            -Dlzma=disabled \
-            -Dzlib=enabled \
-            -Dtests=disabled \
-            -Dexpat=disabled
+            -Dzlib=enabled
           ninja -C build
           ninja -C build install
 
@@ -620,8 +628,25 @@ jobs:
       # THIS PAIRING IS DELIBERATE, NOT ARBITRARY -- SVT-AV1's public C API
       # is not stable across majors, and FFmpeg's libsvtav1.c wrapper is
       # compiled against whatever struct/function shape existed at the
-      # time each FFmpeg version was cut:
+      # time each FFmpeg version was cut. Quick reference for which
+      # ffmpeg_version to pair with which svtav1_version:
       #
+      #   SVT-AV1 < 3.0.0 (this workflow's default, v2.3.0)
+      #     -> any FFmpeg up to and including n6.1/release/6.1 (pre-6.1.2),
+      #        release/4.4 (pre-backport), or plain "master" checked out
+      #        before 22 Feb 2025. This is the default pairing above.
+      #
+      #   SVT-AV1 3.0.0 - 3.x.x
+      #     -> FFmpeg release/6.1 tags 6.1.2+, release/4.4 with the
+      #        backport, or mainline FFmpeg 8.0 (commit d1ed5c06e).
+      #        NOT n6.1 (frozen before the backport) and NOT FFmpeg 7.1
+      #        (released Sep 2024, before the Feb 2025 fix existed).
+      #
+      #   SVT-AV1 4.0.0+
+      #     -> FFmpeg 8.1+ (commit a5d4c398b4). FFmpeg 8.0 predates that
+      #        fix and will fail to build against SVT-AV1 4.0+.
+      #
+      # The two breaking changes, in detail:
       #   1. SVT-AV1 3.0.0 changed svt_av1_enc_init_handle() from 3 args to
       #      2 (commit 988e930c). FFmpeg only learned to handle both
       #      shapes in commit d1ed5c06e (22 Feb 2025), backported into the
@@ -629,7 +654,8 @@ jobs:
       #      into the frozen "n6.1" tag this workflow defaults to.
       #   2. SVT-AV1 4.0.0 then removed enable_adaptive_quantization from
       #      EbSvtAv1EncConfiguration. FFmpeg's workaround (commit
-      #      a5d4c398b4) only landed in FFmpeg 8.1 -- still not in n6.1.
+      #      a5d4c398b4) only landed in FFmpeg 8.1 -- still not in n6.1
+      #      or 8.0.
       #
       # v2.3.0 predates both API breaks, so it links cleanly against
       # n6.1's wrapper as-is. If you bump ffmpeg_version to n8.1+ (or any
