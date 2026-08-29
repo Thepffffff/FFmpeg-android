@@ -944,11 +944,20 @@ jobs:
       # of its own -- its built-in default value is "../android/android-ndk/"
       # for exactly this reason -- so without the trailing slash here the
       # two halves run together into one invalid path.
+      # javacpp's own reactor build includes an "osgi" integration-test
+      # module that maven-invoker-plugin runs during the same "install"
+      # goal we're calling here -- separate from, and not covered by,
+      # -DskipTests (that only skips Surefire/unit tests; invoker-plugin
+      # executions are a different mechanism entirely). We only need the
+      # compiled libjnijavacpp.so this module produces, not a clean OSGi
+      # bundle integration-test pass, so skip it via the invoker plugin's
+      # own documented system property:
+      # https://maven.apache.org/plugins/maven-invoker-plugin/examples/skipping.html
       - name: Build JavaCPP (Java tooling + native JNI runtime) for ${{ matrix.javacpp_platform }}
         working-directory: javacpp-src
         run: |
           set -e
-          mvn -B -q install -DskipTests \
+          mvn -B -q install -DskipTests -Dinvoker.skip=true \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
             -Djavacpp.platform.root="$ANDROID_NDK_HOME/"
 
@@ -989,7 +998,7 @@ jobs:
         run: |
           set -e
           mvn -B -q -pl ffmpeg -am install \
-            -DskipTests \
+            -DskipTests -Dinvoker.skip=true \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
             -Djavacpp.platform.root="$ANDROID_NDK_HOME/" \
             -Dexec.skip=true \
