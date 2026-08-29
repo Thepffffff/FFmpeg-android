@@ -1,22 +1,41 @@
 name: Build FFmpeg + ffprobe for Android with libs
 
-# Output shape: for each ABI, one FFmpeg-android-<abi>.zip containing the
-# ffmpeg and ffprobe executables PLUS every FFmpeg shared library
-# (libavcodec.so, libavformat.so, libavutil.so, libavfilter.so,
-# libavdevice.so, libswscale.so, libswresample.so) and libc++_shared.so,
-# all flattened into a single folder. The two executables are linked with
-# -Wl,-rpath,$ORIGIN (see the FFmpeg configure step), so as long as this
-# folder is extracted intact and ffmpeg/ffprobe are run from inside it (or
-# from a path that still has the .so files alongside them), no
-# LD_LIBRARY_PATH or system install step is required.
+# Output shape: for each ABI, one FFmpeg-android-<abi>.zip containing
+# EXACTLY 17 files -- the ffmpeg and ffprobe executables, every FFmpeg
+# shared library (libavcodec.so, libavformat.so, libavutil.so,
+# libavfilter.so, libavdevice.so, libswscale.so, libswresample.so), and
+# the JavaCPP JNI binding libraries (libjniavcodec.so, libjniavformat.so,
+# libjniavfilter.so, libjniavdevice.so, libjniavutil.so,
+# libjniswscale.so, libjniswresample.so, libjnijavacpp.so) that let
+# JavaCV / Bytedeco's FFmpeg Java bindings call this exact custom build
+# from Java/Kotlin on Android. All flattened into a single folder.
+# The executables and libav*.so files are linked with -Wl,-rpath,$ORIGIN
+# (see the FFmpeg configure step), so as long as this folder is
+# extracted intact and ffmpeg/ffprobe are run from inside it (or from a
+# path that still has the .so files alongside them), no LD_LIBRARY_PATH
+# or system install step is required. The libjni*.so files are loaded by
+# the JVM/ART class loader instead (via java.library.path or an APK's
+# jniLibs), not by ffmpeg/ffprobe themselves.
 #
 # Every third-party codec/library below is built as a static (.a) archive
 # with -fPIC and gets linked INTO FFmpeg's own shared libraries at the
 # final configure/make step -- i.e. you will not find a separate
 # libmp3lame.so or libopus.so in the output, their code lives inside
-# libavcodec.so/libavformat.so. The only extra runtime .so besides
-# FFmpeg's own is libc++_shared.so, copied in because OpenH264 (and
-# potentially SRT) pull in the C++ runtime; see the packaging step.
+# libavcodec.so/libavformat.so.
+#
+# NO libc++_shared.so IN THE OUTPUT, ON PURPOSE: OpenH264 is a C++
+# library, so something has to supply the C++ runtime it needs. Instead
+# of dynamically linking against the NDK's shared libc++.so (which would
+# mean shipping libc++_shared.so as an 18th file and hoping every
+# consumer of this package extracts it alongside everything else),
+# FFmpeg's own final link step statically links libc++ instead
+# (-lc++_static -lc++abi, plus -nostdlib++ so the compiler driver doesn't
+# *also* pull in the shared one by default) -- see the "Configure and
+# build FFmpeg + ffprobe" step below. The C++ runtime code that OpenH264
+# needs ends up baked directly into libavcodec.so, so there's no separate
+# runtime .so to lose track of and no risk of an UnsatisfiedLinkError /
+# crash from a missing libc++_shared.so on a device that doesn't already
+# have one lying around.
 
 on:
   workflow_dispatch:
@@ -88,6 +107,20 @@ on:
         description: "zlib git tag to build (e.g. v1.3.2)"
         required: false
         default: "v1.3.2"
+      javacpp_version:
+        description: "JavaCPP (core JNI runtime, produces libjnijavacpp.so) git tag to build (e.g. 1.5.10)"
+        required: false
+        default: "1.5.10"
+      javacpp_presets_version:
+        description: >-
+          JavaCPP Presets git tag to build the FFmpeg JNI bindings
+          (libjniavcodec.so etc.) against. Must be a release whose
+          bundled ffmpeg preset matches ffmpeg_version's API shape --
+          javacpp-presets 1.5.10 targets FFmpeg 6.1.x, which lines up
+          with the n6.1 default above. Bump both together if you change
+          ffmpeg_version to a different major/minor.
+        required: false
+        default: "1.5.10"
   push:
     branches: [ main ]
     paths:
@@ -116,6 +149,8 @@ env:
   SVTAV1_VERSION: ${{ github.event.inputs.svtav1_version || 'v2.3.0' }}
   OPENSSL_VERSION: ${{ github.event.inputs.openssl_version || 'openssl-3.5.8' }}
   ZLIB_VERSION: ${{ github.event.inputs.zlib_version || 'v1.3.2' }}
+  JAVACPP_VERSION: ${{ github.event.inputs.javacpp_version || '1.5.10' }}
+  JAVACPP_PRESETS_VERSION: ${{ github.event.inputs.javacpp_presets_version || '1.5.10' }}
 
 jobs:
   build:
@@ -132,6 +167,7 @@ jobs:
             vpx_target: arm64-android-gcc
             openssl_target: android-arm64
             meson_cpu_family: aarch64
+            javacpp_platform: android-arm64
           - abi: x86_64
             arch: x86_64
             triple: x86_64-linux-android
@@ -139,6 +175,7 @@ jobs:
             vpx_target: x86_64-android-gcc
             openssl_target: android-x86_64
             meson_cpu_family: x86_64
+            javacpp_platform: android-x86_64
 
     steps:
       - name: Checkout workflow repo
@@ -149,6 +186,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake build-essential cmake git \
             libtool pkg-config wget yasm nasm meson ninja-build zip unzip
+
+      # Needed later for the JavaCPP / JavaCPP-Presets steps that build
+      # the libjni*.so JNI bindings -- javacpp itself is a Java program
+      # (an annotation parser + C++ code generator), even though what it
+      # ultimately produces here is native ARM64/x86_64 .so files.
+      - name: Set up JDK for JavaCPP build
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
@@ -367,9 +414,13 @@ jobs:
       # install-static only installs the header + libopenh264.a, no
       # pkgconfig file, so FFmpeg's configure can't find it via
       # pkg-config unless we write one ourselves. OpenH264 is a C++
-      # library; -lc++ links it against the NDK's shared C++ runtime,
-      # which is why libc++_shared.so gets copied into the final package
-      # folder in the "Package" step below.
+      # library and does need the C++ runtime at link time -- but that
+      # runtime is supplied globally, once, via FFmpeg's own
+      # --extra-libs="-lc++_static -lc++abi ..." on the final configure
+      # step below, not per-dependency here. Adding "-lc++" (the shared
+      # runtime) to this .pc file too would risk pulling in both the
+      # static and shared C++ runtime at once, which is exactly what
+      # -nostdlib++ on the FFmpeg configure step is there to avoid.
       - name: Generate openh264 pkg-config file
         run: |
           set -e
@@ -383,7 +434,7 @@ jobs:
           Name: openh264
           Description: OpenH264: H.264 codec library
           Version: ${OPENH264_VERSION#v}
-          Libs: -L\${libdir} -lopenh264 -lc++
+          Libs: -L\${libdir} -lopenh264
           Libs.private: -lm -ldl
           Cflags: -I\${includedir}
           EOF
@@ -771,6 +822,21 @@ jobs:
       # dependency's full private link chain (e.g. SRT pulling in
       # -lcrypto -lssl), which matters because every one of those
       # dependencies is itself a static archive.
+      #
+      # STATIC LIBC++ (no libc++_shared.so in the output): OpenH264 is a
+      # C++ library, so libavcodec.so needs the C++ runtime from
+      # somewhere. -nostdlib++ on both extra-cflags and extra-ldflags
+      # tells clang not to implicitly link the NDK's shared libc++.so the
+      # way it normally would the moment any C++ object file is in the
+      # link; --extra-libs then supplies the C++ runtime explicitly and
+      # statically instead (-lc++_static -lc++abi), so that code ends up
+      # compiled directly into libavcodec.so/ffmpeg/ffprobe. The rest of
+      # --extra-libs (-llog -ldl -lm -lc -lz -latomic) mirrors what a
+      # normal NDK link would pull in anyway; listing them explicitly
+      # here just keeps them from getting dropped once the implicit C++
+      # stdlib link (which normally drags some of these in transitively)
+      # is turned off. Net effect: no separate libc++_shared.so needs to
+      # ship alongside ffmpeg/ffprobe/libav*.so for OpenH264 to work.
       - name: Configure and build FFmpeg + ffprobe for ${{ matrix.abi }}
         working-directory: ffmpeg-src
         run: |
@@ -813,8 +879,9 @@ jobs:
             --enable-libwebp \
             --enable-libaom \
             --enable-libsvtav1 \
-            --extra-cflags="-I$DEPS_PREFIX/include" \
-            --extra-ldflags="-L$DEPS_PREFIX/lib -Wl,-rpath,\\\$ORIGIN" \
+            --extra-cflags="-I$DEPS_PREFIX/include -nostdlib++" \
+            --extra-ldflags="-L$DEPS_PREFIX/lib -nostdlib++ -Wl,-rpath,\\\$ORIGIN" \
+            --extra-libs="-llog -lc++_static -lc++abi -ldl -lm -lc -lz -latomic" \
             --pkg-config-flags="--static" \
             --pkg-config="$(which pkg-config)"
           make -j"$(nproc)"
@@ -830,17 +897,123 @@ jobs:
           name: ffmpeg-config-log-${{ matrix.abi }}
           path: ffmpeg-src/ffbuild/config.log
 
+      # ---------- JavaCPP JNI bindings (libjni*.so) ----------
+      # Everything above builds "plain" FFmpeg -- these steps additionally
+      # build the JNI glue libraries (libjniavcodec.so, libjniavformat.so,
+      # libjniavfilter.so, libjniavdevice.so, libjniavutil.so,
+      # libjniswscale.so, libjniswresample.so, plus JavaCPP's own
+      # libjnijavacpp.so runtime helper) that let JavaCV / Bytedeco's
+      # FFmpeg Java bindings call this exact custom build from Java/Kotlin
+      # on Android, instead of only being usable from the command line or
+      # native (NDK) code.
+      #
+      # These come from the bytedeco/javacpp and bytedeco/javacpp-presets
+      # projects, not from FFmpeg itself: javacpp-presets ships Java
+      # classes annotated with @Platform that describe FFmpeg's C API, and
+      # the javacpp tool (itself a Java program) parses those annotations,
+      # generates a thin C++ JNI wrapper per module, and compiles+links
+      # each wrapper into its own libjni<module>.so against the real
+      # libav*.so files -- here, the ones just built above with the extra
+      # codecs, not a vanilla FFmpeg.
+      - name: Clone JavaCPP ${{ env.JAVACPP_VERSION }}
+        run: git clone --depth 1 --branch "${JAVACPP_VERSION}" https://github.com/bytedeco/javacpp.git javacpp-src
+
+      - name: Clone JavaCPP Presets ${{ env.JAVACPP_PRESETS_VERSION }}
+        run: git clone --depth 1 --branch "${JAVACPP_PRESETS_VERSION}" https://github.com/bytedeco/javacpp-presets.git javacpp-presets-src
+
+      # Builds javacpp's own Java tooling (the annotation parser/code
+      # generator) AND, because -Djavacpp.platform is given here already,
+      # cross-compiles javacpp's own small native JNI helper
+      # (libjnijavacpp.so) for this ABI in the same pass -- every other
+      # libjni*.so below is loaded via this one at runtime, so it has to
+      # ship in the final package alongside them even though it isn't
+      # FFmpeg-specific.
+      #
+      # javacpp's Android platform profiles resolve the NDK toolchain from
+      # ANDROID_NDK_HOME, which "Set common build environment" above
+      # already exported.
+      - name: Build JavaCPP (Java tooling + native JNI runtime) for ${{ matrix.javacpp_platform }}
+        working-directory: javacpp-src
+        run: |
+          set -e
+          mvn -B -q install -DskipTests -Djavacpp.platform=${{ matrix.javacpp_platform }}
+
+      # Points the ffmpeg preset at the FFmpeg we already built above
+      # (headers + .so's under $FFMPEG_PREFIX) instead of letting
+      # javacpp-presets' own ffmpeg/cppbuild.sh download and build a
+      # second, vanilla copy of FFmpeg from scratch.
+      - name: Point FFmpeg preset at our custom FFmpeg build
+        run: |
+          set -e
+          echo "JAVACPP_FFMPEG_INCLUDE=$FFMPEG_PREFIX/include" >> "$GITHUB_ENV"
+          echo "JAVACPP_FFMPEG_LIB=$FFMPEG_PREFIX/lib" >> "$GITHUB_ENV"
+
+      # Builds just the ffmpeg preset module (-pl ffmpeg -am also builds
+      # the reactor modules it depends on, e.g. the "platform" parent POM)
+      # for this one ABI, generating + compiling libjniavcodec.so,
+      # libjniavformat.so, libjniavfilter.so, libjniavdevice.so,
+      # libjniavutil.so, libjniswscale.so, and libjniswresample.so.
+      #
+      # -Dexec.skip=true stops the exec-maven-plugin execution normally
+      # bound to cppbuild.sh (which would otherwise try to download and
+      # build its own vanilla FFmpeg) from running at all, and the
+      # javacpp.platform.includepath/linkpath/preloadpath properties tell
+      # the javacpp compiler where to find the headers and .so's to link
+      # and later load against instead -- our own custom FFmpeg build.
+      #
+      # THIS STEP IS THE MOST VERSION-FRAGILE PART OF THIS WORKFLOW: the
+      # exact property/skip names above match javacpp-presets
+      # ${{ env.JAVACPP_PRESETS_VERSION }} as documented at the time this
+      # was written, but Bytedeco has changed cppbuild plumbing between
+      # releases before. If this step fails to skip the internal FFmpeg
+      # download/build, check javacpp-presets-src/ffmpeg/cppbuild.sh and
+      # javacpp-presets-src/ffmpeg/pom.xml on the pinned tag for whatever
+      # the current override mechanism is, and adjust the flags below to
+      # match.
+      - name: Build FFmpeg JavaCPP JNI bindings for ${{ matrix.javacpp_platform }}
+        working-directory: javacpp-presets-src
+        run: |
+          set -e
+          mvn -B -q -pl ffmpeg -am install \
+            -DskipTests \
+            -Djavacpp.platform=${{ matrix.javacpp_platform }} \
+            -Dexec.skip=true \
+            -Djavacpp.platform.includepath="$JAVACPP_FFMPEG_INCLUDE" \
+            -Djavacpp.platform.linkpath="$JAVACPP_FFMPEG_LIB" \
+            -Djavacpp.platform.preloadpath="$JAVACPP_FFMPEG_LIB"
+
+      - name: Upload JavaCPP build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: javacpp-build-logs-${{ matrix.abi }}
+          path: |
+            javacpp-src/target/*.log
+            javacpp-presets-src/ffmpeg/target/*.log
+          if-no-files-found: ignore
+
+      # javacpp/javacpp-presets place each platform's compiled native
+      # libraries under target/classes/org/bytedeco/<module>/<platform>/
+      # inside the respective Maven module -- collect the ones this
+      # package needs into one place before the final packaging step.
+      - name: Collect JNI shared libraries for ${{ matrix.abi }}
+        run: |
+          set -e
+          JNI_STAGE_DIR="$GITHUB_WORKSPACE/jnilibs/${{ matrix.abi }}"
+          mkdir -p "$JNI_STAGE_DIR"
+          cp "javacpp-src/target/classes/org/bytedeco/javacpp/${{ matrix.javacpp_platform }}/libjnijavacpp.so" "$JNI_STAGE_DIR/"
+          cp javacpp-presets-src/ffmpeg/target/classes/org/bytedeco/ffmpeg/${{ matrix.javacpp_platform }}/libjni*.so "$JNI_STAGE_DIR/"
+          echo "Collected JNI libs for ${{ matrix.abi }}:"
+          ls -la "$JNI_STAGE_DIR"
+
       # ---------- Package: one flat folder per ABI ----------
       # Everything ffmpeg/ffprobe need at runtime -- the two executables,
-      # every libav*.so FFmpeg just produced, and libc++_shared.so from
-      # the NDK sysroot -- goes into the same directory and gets zipped
-      # flat (zip -j). libc++_shared.so specifically: OpenH264 (and
-      # potentially SRT, depending on how their build resolved the C++
-      # STL choice) link against the NDK's shared C++ runtime rather than
-      # a static copy, and unlike a normal Android app there's no
-      # guarantee that library is reachable when these binaries are
-      # exec()'d directly outside of an APK -- so it travels with the zip
-      # like any other dependency.
+      # every libav*.so FFmpeg just produced, and the libjni*.so JavaCPP
+      # bindings collected above -- goes into the same directory and gets
+      # zipped flat (zip -j). No libc++_shared.so here: OpenH264's C++
+      # runtime was statically linked into libavcodec.so at the FFmpeg
+      # configure step above (-lc++_static -lc++abi -nostdlib++), so
+      # there's nothing left that dynamically depends on it.
       #
       # `cp -L` dereferences the .so version symlinks FFmpeg's own
       # install step creates (libavcodec.so -> libavcodec.so.60 -> the
@@ -858,7 +1031,7 @@ jobs:
           cp "$FFMPEG_PREFIX/bin/ffmpeg" "$PACKAGE_DIR/"
           cp "$FFMPEG_PREFIX/bin/ffprobe" "$PACKAGE_DIR/"
           cp -L "$FFMPEG_PREFIX"/lib/*.so* "$PACKAGE_DIR/"
-          cp "$TOOLCHAIN/sysroot/usr/lib/${{ matrix.triple }}/libc++_shared.so" "$PACKAGE_DIR/"
+          cp "$GITHUB_WORKSPACE/jnilibs/${{ matrix.abi }}"/*.so "$PACKAGE_DIR/"
 
           chmod +x "$PACKAGE_DIR/ffmpeg" "$PACKAGE_DIR/ffprobe"
           "$STRIP" "$PACKAGE_DIR"/*.so* || true
@@ -867,7 +1040,7 @@ jobs:
           ARCHIVE="$GITHUB_WORKSPACE/dist/FFmpeg-android-${{ matrix.abi }}.zip"
           ( cd "$PACKAGE_DIR" && zip -j "$ARCHIVE" * )
 
-          echo "Archive contents for ${{ matrix.abi }}:"
+          echo "Archive contents for ${{ matrix.abi }} ($(unzip -l "$ARCHIVE" | tail -1 | awk '{print $2}') files):"
           unzip -l "$ARCHIVE"
 
       - name: Upload archive for ${{ matrix.abi }}
@@ -888,12 +1061,19 @@ jobs:
             echo "### FFmpeg + ffprobe for Android -- build summary"
             echo ""
             echo "Output: one \`FFmpeg-android-<abi>.zip\` per ABI. Each zip is a"
-            echo "single flat folder containing \`ffmpeg\`, \`ffprobe\`,"
-            echo "\`libc++_shared.so\`, and every FFmpeg shared library"
-            echo "(\`libavcodec.so\`, \`libavformat.so\`, \`libavutil.so\`,"
-            echo "\`libavfilter.so\`, \`libavdevice.so\`, \`libswscale.so\`,"
-            echo "\`libswresample.so\`). Every codec below is statically linked"
-            echo "into those libraries, not shipped as its own .so."
+            echo "single flat folder containing exactly 17 files: \`ffmpeg\`,"
+            echo "\`ffprobe\`, every FFmpeg shared library (\`libavcodec.so\`,"
+            echo "\`libavformat.so\`, \`libavutil.so\`, \`libavfilter.so\`,"
+            echo "\`libavdevice.so\`, \`libswscale.so\`, \`libswresample.so\`),"
+            echo "and the JavaCPP JNI bindings (\`libjniavcodec.so\`,"
+            echo "\`libjniavformat.so\`, \`libjniavfilter.so\`,"
+            echo "\`libjniavdevice.so\`, \`libjniavutil.so\`,"
+            echo "\`libjniswscale.so\`, \`libjniswresample.so\`,"
+            echo "\`libjnijavacpp.so\`). Every codec below is statically linked"
+            echo "into the FFmpeg libraries, not shipped as its own .so, and"
+            echo "OpenH264's C++ runtime is statically linked too"
+            echo "(\`-lc++_static -lc++abi -nostdlib++\`) -- so there is no"
+            echo "\`libc++_shared.so\` in the output."
             echo ""
             echo "| Component | Version |"
             echo "|---|---|"
@@ -914,6 +1094,8 @@ jobs:
             echo "| SVT-AV1 | \`${SVTAV1_VERSION}\` |"
             echo "| OpenSSL | \`${OPENSSL_VERSION}\` |"
             echo "| zlib | \`${ZLIB_VERSION}\` |"
+            echo "| JavaCPP (libjnijavacpp.so) | \`${JAVACPP_VERSION}\` |"
+            echo "| JavaCPP Presets (libjni*.so FFmpeg bindings) | \`${JAVACPP_PRESETS_VERSION}\` |"
             echo "| MediaCodec (Android HW) | native, \`--enable-mediacodec --enable-jni\` |"
             echo ""
             echo "ABIs: arm64-v8a, x86_64"
