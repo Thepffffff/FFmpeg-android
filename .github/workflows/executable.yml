@@ -971,28 +971,72 @@ jobs:
           echo "JAVACPP_FFMPEG_INCLUDE=$FFMPEG_PREFIX/include" >> "$GITHUB_ENV"
           echo "JAVACPP_FFMPEG_LIB=$FFMPEG_PREFIX/lib" >> "$GITHUB_ENV"
 
+      # cppbuild.sh (the root script Maven's "javacpp-cppbuild-install"
+      # execution actually invokes -- it then internally dispatches to
+      # ffmpeg/cppbuild.sh) is what tries to download nasm/zlib and build
+      # a vanilla FFmpeg from scratch. Rather than rely on a Maven
+      # property to skip that invocation -- the exact property/wiring for
+      # this has changed across javacpp-presets releases, and simply
+      # passing -Djavacpp.cppbuild.skip=true did not stop it for
+      # ${{ env.JAVACPP_PRESETS_VERSION }} in practice -- replace the
+      # script itself with a no-op. Whatever mechanism this particular
+      # pinned version uses to invoke it, the invocation now does
+      # nothing, so there's nothing left to fail on a dead download link.
+      - name: Neutralize javacpp-presets' own cppbuild.sh
+        working-directory: javacpp-presets-src
+        run: |
+          set -e
+          cat > cppbuild.sh <<'EOF'
+          #!/bin/bash
+          # Neutralized by this workflow -- our own custom-built FFmpeg is
+          # staged directly into ffmpeg/cppbuild/<platform>/ instead (see
+          # the "Stage our own FFmpeg..." step), so there is nothing for
+          # this script to download or build.
+          exit 0
+          EOF
+          chmod +x cppbuild.sh
+
+      # With cppbuild.sh neutralized, the javacpp compiler needs our
+      # already-built FFmpeg sitting exactly where the ffmpeg preset's
+      # pom.xml expects cppbuild.sh to have put it:
+      # ffmpeg/cppbuild/<platform>/include/, .../lib/, and .../bin/.
+      # Populating this directly (rather than relying only on the
+      # -Djavacpp.platform.includepath/linkpath/preloadpath overrides
+      # further below, whose exact property names have also shifted
+      # between javacpp-presets releases) means the JNI-wrapper compile
+      # step works off Maven's own DEFAULT paths, not an override that
+      # may or may not be honored by this particular pinned version.
+      - name: Stage our own FFmpeg into the ffmpeg preset's expected cppbuild layout
+        run: |
+          set -e
+          STAGE_DIR="javacpp-presets-src/ffmpeg/cppbuild/${{ matrix.javacpp_platform }}"
+          mkdir -p "$STAGE_DIR/include" "$STAGE_DIR/lib" "$STAGE_DIR/bin"
+          cp -a "$FFMPEG_PREFIX/include/." "$STAGE_DIR/include/"
+          cp -aL "$FFMPEG_PREFIX/lib/." "$STAGE_DIR/lib/"
+          cp -a "$FFMPEG_PREFIX/bin/." "$STAGE_DIR/bin/" 2>/dev/null || true
+          echo "Staged FFmpeg for ${{ matrix.javacpp_platform }}:"
+          find "$STAGE_DIR" -maxdepth 2
+
       # Builds just the ffmpeg preset module (-pl ffmpeg -am also builds
       # the reactor modules it depends on, e.g. the "platform" parent POM)
       # for this one ABI, generating + compiling libjniavcodec.so,
       # libjniavformat.so, libjniavfilter.so, libjniavdevice.so,
       # libjniavutil.so, libjniswscale.so, and libjniswresample.so.
       #
-      # -Dexec.skip=true stops the exec-maven-plugin execution normally
-      # bound to cppbuild.sh (which would otherwise try to download and
-      # build its own vanilla FFmpeg) from running at all, and the
-      # javacpp.platform.includepath/linkpath/preloadpath properties tell
-      # the javacpp compiler where to find the headers and .so's to link
-      # and later load against instead -- our own custom FFmpeg build.
-      #
-      # THIS STEP IS THE MOST VERSION-FRAGILE PART OF THIS WORKFLOW: the
-      # exact property/skip names above match javacpp-presets
-      # ${{ env.JAVACPP_PRESETS_VERSION }} as documented at the time this
-      # was written, but Bytedeco has changed cppbuild plumbing between
-      # releases before. If this step fails to skip the internal FFmpeg
-      # download/build, check javacpp-presets-src/ffmpeg/cppbuild.sh and
-      # javacpp-presets-src/ffmpeg/pom.xml on the pinned tag for whatever
-      # the current override mechanism is, and adjust the flags below to
-      # match.
+      # -Djavacpp.cppbuild.skip=true is documented in javacpp-presets'
+      # own README as the way to skip cppbuild.sh, but in practice it had
+      # no effect against ${{ env.JAVACPP_PRESETS_VERSION }} -- the build
+      # still tried (and failed) to download nasm/zlib and build its own
+      # vanilla FFmpeg. Rather than keep chasing the exact property name
+      # this particular pinned tag honors, the two steps above
+      # ("Neutralize..." and "Stage our own FFmpeg...") make the download
+      # impossible regardless: cppbuild.sh itself is now a no-op, and our
+      # FFmpeg is already sitting at the exact path
+      # (ffmpeg/cppbuild/${{ matrix.javacpp_platform }}/include|lib/)
+      # that javacpp's default include/link path configuration expects.
+      # -Djavacpp.cppbuild.skip=true and the platform.includepath/
+      # linkpath/preloadpath overrides below are kept as harmless
+      # belt-and-suspenders in case this version DOES honor them too.
       - name: Build FFmpeg JavaCPP JNI bindings for ${{ matrix.javacpp_platform }}
         working-directory: javacpp-presets-src
         run: |
@@ -1001,7 +1045,7 @@ jobs:
             -DskipTests -Dinvoker.skip=true \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
             -Djavacpp.platform.root="$ANDROID_NDK_HOME/" \
-            -Dexec.skip=true \
+            -Djavacpp.cppbuild.skip=true \
             -Djavacpp.platform.includepath="$JAVACPP_FFMPEG_INCLUDE" \
             -Djavacpp.platform.linkpath="$JAVACPP_FFMPEG_LIB" \
             -Djavacpp.platform.preloadpath="$JAVACPP_FFMPEG_LIB"
