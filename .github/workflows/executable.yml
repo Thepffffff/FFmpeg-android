@@ -931,21 +931,26 @@ jobs:
       #
       # javacpp's Android platform profiles do NOT automatically read
       # ANDROID_NDK_HOME the way FFmpeg's ./configure does -- they need
-      # the NDK location handed in explicitly as the "platform.root"
-      # Maven system property. Without it, javacpp resolves that property
-      # to an empty string and generates compiler commands with nothing
-      # in front of "toolchains/llvm/prebuilt/.../clang++", which then
-      # fail with "No such file or directory" because that relative path
-      # doesn't exist from wherever Maven's working directory happens to
-      # be. ANDROID_NDK_HOME (no trailing slash) already points at the
-      # extracted NDK root from the "Set common build environment" step.
+      # the NDK location handed in explicitly as the "javacpp.platform.root"
+      # Maven/Java system property (confirmed in the javacpp-presets
+      # README: "The -Djavacpp.platform.root=... option is required only
+      # for Android builds."). A previous version of this workflow passed
+      # "-Dplatform.root" (no "javacpp." prefix) instead, which javacpp
+      # silently ignores -- it isn't the real property name, so the build
+      # kept resolving to the same broken relative compiler path either
+      # way. Also note the trailing slash on $ANDROID_NDK_HOME/: javacpp
+      # concatenates platform.root directly onto platform.compiler
+      # (e.g. "toolchains/llvm/prebuilt/.../clang++") with no separator
+      # of its own -- its built-in default value is "../android/android-ndk/"
+      # for exactly this reason -- so without the trailing slash here the
+      # two halves run together into one invalid path.
       - name: Build JavaCPP (Java tooling + native JNI runtime) for ${{ matrix.javacpp_platform }}
         working-directory: javacpp-src
         run: |
           set -e
           mvn -B -q install -DskipTests \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
-            -Dplatform.root="$ANDROID_NDK_HOME"
+            -Djavacpp.platform.root="$ANDROID_NDK_HOME/"
 
       # Points the ffmpeg preset at the FFmpeg we already built above
       # (headers + .so's under $FFMPEG_PREFIX) instead of letting
@@ -986,7 +991,7 @@ jobs:
           mvn -B -q -pl ffmpeg -am install \
             -DskipTests \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
-            -Dplatform.root="$ANDROID_NDK_HOME" \
+            -Djavacpp.platform.root="$ANDROID_NDK_HOME/" \
             -Dexec.skip=true \
             -Djavacpp.platform.includepath="$JAVACPP_FFMPEG_INCLUDE" \
             -Djavacpp.platform.linkpath="$JAVACPP_FFMPEG_LIB" \
