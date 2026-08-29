@@ -957,7 +957,7 @@ jobs:
         working-directory: javacpp-src
         run: |
           set -e
-          mvn -B -q install -DskipTests -Dinvoker.skip=true \
+          mvn -B install -DskipTests -Dinvoker.skip=true \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
             -Djavacpp.platform.root="$ANDROID_NDK_HOME/"
 
@@ -1041,7 +1041,7 @@ jobs:
         working-directory: javacpp-presets-src
         run: |
           set -e
-          mvn -B -q -pl ffmpeg -am install \
+          mvn -B -pl ffmpeg -am install \
             -DskipTests -Dinvoker.skip=true \
             -Djavacpp.platform=${{ matrix.javacpp_platform }} \
             -Djavacpp.platform.root="$ANDROID_NDK_HOME/" \
@@ -1069,8 +1069,37 @@ jobs:
           set -e
           JNI_STAGE_DIR="$GITHUB_WORKSPACE/jnilibs/${{ matrix.abi }}"
           mkdir -p "$JNI_STAGE_DIR"
-          cp "javacpp-src/target/classes/org/bytedeco/javacpp/${{ matrix.javacpp_platform }}/libjnijavacpp.so" "$JNI_STAGE_DIR/"
-          cp javacpp-presets-src/ffmpeg/target/classes/org/bytedeco/ffmpeg/${{ matrix.javacpp_platform }}/libjni*.so "$JNI_STAGE_DIR/"
+
+          # NOTE ON OUTPUT PATHS: on desktop platforms JavaCPP's Builder
+          # writes each built .so to
+          # target/classes/org/bytedeco/<module>/<platform>/, but the
+          # Android platform property files
+          # (org/bytedeco/javacpp/properties/android-*.properties) override
+          # "platform.library.path" to "lib/<android-abi>/" -- i.e.
+          # lib/arm64-v8a/ and lib/x86_64/. So for Android the artifacts land
+          # in target/classes/lib/${{ matrix.abi }}/ instead. (This is also
+          # why javacpp's own pom.xml has an "<include>lib/</include>
+          # <!-- for Android -->" entry in its platform jar execution.)
+          # Search both layouts so this step is correct either way.
+          collect() {
+            module_root="$1"   # e.g. javacpp-src/target/classes
+            pattern="$2"       # e.g. libjnijavacpp.so
+            found=$(find "$module_root" -type f -name "$pattern" 2>/dev/null || true)
+            if [ -z "$found" ]; then
+              echo "ERROR: no $pattern found under $module_root" >&2
+              echo "--- tree for debugging ---" >&2
+              find "$module_root" -name '*.so' >&2 || true
+              return 1
+            fi
+            echo "$found" | while read -r f; do
+              echo "  + $f"
+              cp -f "$f" "$JNI_STAGE_DIR/"
+            done
+          }
+
+          collect javacpp-src/target/classes 'libjnijavacpp.so'
+          collect javacpp-presets-src/ffmpeg/target/classes 'libjni*.so'
+
           echo "Collected JNI libs for ${{ matrix.abi }}:"
           ls -la "$JNI_STAGE_DIR"
 
