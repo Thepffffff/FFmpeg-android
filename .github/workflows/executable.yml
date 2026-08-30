@@ -1070,25 +1070,38 @@ jobs:
           JNI_STAGE_DIR="$GITHUB_WORKSPACE/jnilibs/${{ matrix.abi }}"
           mkdir -p "$JNI_STAGE_DIR"
 
-          # NOTE ON OUTPUT PATHS: on desktop platforms JavaCPP's Builder
-          # writes each built .so to
-          # target/classes/org/bytedeco/<module>/<platform>/, but the
-          # Android platform property files
-          # (org/bytedeco/javacpp/properties/android-*.properties) override
-          # "platform.library.path" to "lib/<android-abi>/" -- i.e.
-          # lib/arm64-v8a/ and lib/x86_64/. So for Android the artifacts land
-          # in target/classes/lib/${{ matrix.abi }}/ instead. (This is also
-          # why javacpp's own pom.xml has an "<include>lib/</include>
-          # <!-- for Android -->" entry in its platform jar execution.)
-          # Search both layouts so this step is correct either way.
+          # WHERE THE .so FILES ACTUALLY LAND (two different layouts!):
+          #
+          # 1. javacpp core (bytedeco/javacpp pom.xml) does NOT set an
+          #    <outputDirectory> for its javacpp-compiler execution, so the
+          #    Builder falls back to target/classes + the platform's
+          #    "platform.library.path" property. The android-*.properties
+          #    files set that to lib/<abi>/, giving:
+          #       javacpp-src/target/classes/lib/${{ matrix.abi }}/libjnijavacpp.so
+          #
+          # 2. javacpp-presets (parent pom.xml, javacpp-compiler execution)
+          #    DOES set one:
+          #       <outputDirectory>${project.build.directory}/native/${javacpp.platform.nativeOutputPath}</outputDirectory>
+          #    and the "javacpp-platform-android-arm64" profile - which is
+          #    auto-activated by -Djavacpp.platform=android-arm64 - overrides
+          #       <javacpp.platform.nativeOutputPath>${javacpp.platform.library.path}</javacpp.platform.nativeOutputPath>
+          #    javacpp's BuildMojo re-exports every platform property into the
+          #    Maven project as "javacpp.<key>", so that resolves to lib/<abi>/:
+          #       javacpp-presets-src/ffmpeg/target/native/lib/${{ matrix.abi }}/libjni*.so
+          #    i.e. target/native/, NOT target/classes/.
+          #
+          # Searching each module's whole target/ tree keeps this correct even
+          # if the layout shifts again in a future javacpp release.
           collect() {
-            module_root="$1"   # e.g. javacpp-src/target/classes
-            pattern="$2"       # e.g. libjnijavacpp.so
-            found=$(find "$module_root" -type f -name "$pattern" 2>/dev/null || true)
+            target_root="$1"   # e.g. javacpp-presets-src/ffmpeg/target
+            pattern="$2"       # e.g. libjni*.so
+            found=$(find "$target_root" -type f -name "$pattern" 2>/dev/null || true)
             if [ -z "$found" ]; then
-              echo "ERROR: no $pattern found under $module_root" >&2
-              echo "--- tree for debugging ---" >&2
-              find "$module_root" -name '*.so' >&2 || true
+              echo "ERROR: no $pattern found under $target_root" >&2
+              echo "--- every .so under $target_root ---" >&2
+              find "$target_root" -name '*.so' >&2 || true
+              echo "--- top-level of $target_root ---" >&2
+              ls -la "$target_root" >&2 || true
               return 1
             fi
             echo "$found" | while read -r f; do
@@ -1097,28 +1110,12 @@ jobs:
             done
           }
 
-          collect javacpp-src/target/classes 'libjnijavacpp.so'
-          collect javacpp-presets-src/ffmpeg/target/classes 'libjni*.so'
+          collect javacpp-src/target 'libjnijavacpp.so'
+          collect javacpp-presets-src/ffmpeg/target 'libjni*.so'
 
           echo "Collected JNI libs for ${{ matrix.abi }}:"
           ls -la "$JNI_STAGE_DIR"
 
-      # ---------- Package: one flat folder per ABI ----------
-      # Everything ffmpeg/ffprobe need at runtime -- the two executables,
-      # every libav*.so FFmpeg just produced, and the libjni*.so JavaCPP
-      # bindings collected above -- goes into the same directory and gets
-      # zipped flat (zip -j). No libc++_shared.so here: OpenH264's C++
-      # runtime was statically linked into libavcodec.so at the FFmpeg
-      # configure step above (-lc++_static -lc++abi -nostdlib++), so
-      # there's nothing left that dynamically depends on it.
-      #
-      # `cp -L` dereferences the .so version symlinks FFmpeg's own
-      # install step creates (libavcodec.so -> libavcodec.so.60 -> the
-      # real file) into plain regular files. This means both the
-      # SONAME-versioned name (libavcodec.so.60, what the dynamic linker
-      # actually looks for via each binary's DT_NEEDED entries) and the
-      # bare name exist as real files in the package -- simpler and more
-      # robust inside a zip than trying to preserve symlinks.
       - name: Package ffmpeg + ffprobe + shared libs for ${{ matrix.abi }}
         run: |
           set -e
