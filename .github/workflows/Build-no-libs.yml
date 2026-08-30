@@ -1,0 +1,195 @@
+name: Build FFmpeg + ffprobe for Android
+
+# Output shape: for each ABI, one artifact ("ffmpeg-android-<abi>") that
+# contains EXACTLY 2 files -- the ffmpeg and ffprobe executables. Nothing
+# else: no libav*.so, no third-party codec/crypto libraries, no JNI
+# bindings. This is the stripped-down counterpart to
+# build-ffmpeg-android.yml (which adds LAME/Opus/OpenH264/OpenSSL/
+# JavaCPP/etc.) -- use this one when all you want is a plain, portable
+# ffmpeg/ffprobe pair.
+#
+# STATIC, NOT SHARED: FFmpeg is configured with --enable-static
+# --disable-shared, so every internal component (libavcodec, libavformat,
+# etc.) gets compiled directly INTO the ffmpeg and ffprobe binaries
+# instead of living in separate .so files alongside them. The only things
+# these binaries still dynamically link against are Android's own base
+# system libraries (libc, libm, libdl, liblog -- always present on every
+# device), so there is nothing else to ship, no LD_LIBRARY_PATH to set,
+# and no risk of the binaries drifting apart from a matching set of .so
+# files. This build has no --enable-jni/--enable-mediacodec either, so it
+# doesn't dynamically depend on Android's libmediandk.so/libcamera2ndk.so
+# system libraries the way the full-featured workflow's build does.
+#
+# NO MANUAL ZIP, ON PURPOSE: actions/upload-artifact already wraps
+# whatever path you give it in exactly one zip file when someone
+# downloads it from the Actions UI. If what you upload is ALSO a .zip
+# you created yourself, the person downloading ends up with a zip
+# containing a zip containing the real files -- an extra, pointless
+# unzip step every time. This workflow just uploads the plain output
+# folder (the two raw binaries) and lets that be the only zip layer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "FFmpeg branch/tag to build (e.g. n6.1, release/6.1, master)"
+        required: false
+        default: "n6.1"
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-ffmpeg-android-minimal.yml'
+
+env:
+  NDK_VERSION: "r26d"
+  API_LEVEL: 21   # minimum Android API level (21 = Android 5.0)
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n6.1' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            arch: aarch64
+            triple: aarch64-linux-android
+          - abi: x86_64
+            arch: x86_64
+            triple: x86_64-linux-android
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      # Just enough to configure/compile plain FFmpeg -- no cmake/meson/
+      # ninja/libtool/wget here since there are no third-party
+      # dependencies to build. nasm is kept for x86_64's hand-written
+      # asm optimizations; arm64's asm doesn't need it, but it's harmless
+      # to have installed either way.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git pkg-config nasm
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Set common build environment
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CC=$TOOLCHAIN/bin/${{ matrix.triple }}${{ env.API_LEVEL }}-clang" >> "$GITHUB_ENV"
+          echo "CXX=$TOOLCHAIN/bin/${{ matrix.triple }}${{ env.API_LEVEL }}-clang++" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_ENV"
+          echo "FFMPEG_PREFIX=$PWD/android-libs/${{ matrix.abi }}" >> "$GITHUB_ENV"
+          mkdir -p "$PWD/android-libs/${{ matrix.abi }}"
+
+      - name: Clone FFmpeg source
+        run: |
+          git clone --depth 1 --branch "${FFMPEG_VERSION}" \
+            https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
+
+      # --enable-static --disable-shared: the whole point of this
+      # workflow -- see the top-of-file comment for why. No
+      # --extra-cflags/--extra-ldflags/--extra-libs/--pkg-config-flags are
+      # needed at all here, unlike the full-featured workflow, because
+      # there are no third-party static archives to link in and no C++
+      # codec (like OpenH264) pulling in the C++ runtime -- plain FFmpeg
+      # is C only.
+      - name: Configure and build FFmpeg + ffprobe for ${{ matrix.abi }}
+        working-directory: ffmpeg-src
+        run: |
+          set -e
+          ./configure \
+            --prefix="$FFMPEG_PREFIX" \
+            --target-os=android \
+            --arch="${{ matrix.arch }}" \
+            --sysroot="$TOOLCHAIN/sysroot" \
+            --cc="$CC" \
+            --cxx="$CXX" \
+            --cross-prefix="$TOOLCHAIN/bin/llvm-" \
+            --enable-cross-compile \
+            --enable-static \
+            --disable-shared \
+            --enable-pic \
+            --disable-doc \
+            --disable-ffplay \
+            --disable-symver \
+            --disable-debug \
+            --enable-small \
+            --enable-optimizations
+          make -j"$(nproc)"
+          make install
+
+          echo "Build output for ${{ matrix.abi }}:"
+          find "$FFMPEG_PREFIX" -maxdepth 2
+
+      - name: Upload config.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-config-log-${{ matrix.abi }}
+          path: ffmpeg-src/ffbuild/config.log
+
+      # Just the two binaries, stripped -- no zip step here (see the
+      # top-of-file comment on why: actions/upload-artifact below already
+      # zips this folder exactly once for download).
+      - name: Package ffmpeg + ffprobe for ${{ matrix.abi }}
+        run: |
+          set -e
+          PACKAGE_DIR="$GITHUB_WORKSPACE/package/${{ matrix.abi }}"
+          mkdir -p "$PACKAGE_DIR"
+
+          cp "$FFMPEG_PREFIX/bin/ffmpeg" "$PACKAGE_DIR/"
+          cp "$FFMPEG_PREFIX/bin/ffprobe" "$PACKAGE_DIR/"
+          chmod +x "$PACKAGE_DIR/ffmpeg" "$PACKAGE_DIR/ffprobe"
+          "$STRIP" "$PACKAGE_DIR/ffmpeg" "$PACKAGE_DIR/ffprobe"
+
+          echo "Package contents for ${{ matrix.abi }}:"
+          ls -la "$PACKAGE_DIR"
+
+      # Uploading the DIRECTORY (not a .zip we made ourselves) is what
+      # avoids zip-inside-zip: actions/upload-artifact zips this exactly
+      # once, so downloading "ffmpeg-android-arm64-v8a" from the Actions
+      # UI gives a zip containing just ffmpeg and ffprobe directly, not a
+      # zip containing another zip.
+      - name: Upload ffmpeg + ffprobe for ${{ matrix.abi }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-android-${{ matrix.abi }}
+          path: package/${{ matrix.abi }}
+          if-no-files-found: error
+
+  summary:
+    name: Build summary
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "### FFmpeg + ffprobe for Android (minimal) -- build summary"
+            echo ""
+            echo "Two artifacts were produced, one per ABI:"
+            echo "\`ffmpeg-android-arm64-v8a\` and \`ffmpeg-android-x86_64\`."
+            echo "Each one is exactly 2 files -- \`ffmpeg\` and \`ffprobe\`,"
+            echo "statically linked with no separate .so's, no third-party"
+            echo "codec/crypto libraries, and no JNI bindings. Downloading"
+            echo "either artifact gives you those two files directly with"
+            echo "no nested zip."
+            echo ""
+            echo "| Component | Version |"
+            echo "|---|---|"
+            echo "| FFmpeg | \`${FFMPEG_VERSION}\` |"
+            echo "| Android NDK | \`${NDK_VERSION}\` (min API ${API_LEVEL}) |"
+            echo ""
+            echo "ABIs: arm64-v8a, x86_64"
+          } >> "$GITHUB_STEP_SUMMARY"
