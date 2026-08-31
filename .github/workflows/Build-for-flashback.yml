@@ -1,4 +1,4 @@
-name: Build FFmpeg + ffprobe for Android with libs for flashback
+name: Build FFmpeg + ffprobe for Android with libs
 
 # Output shape: for each ABI, one FFmpeg-android-<abi>.zip containing
 # EXACTLY 17 files -- the ffmpeg and ffprobe executables, every FFmpeg
@@ -16,6 +16,17 @@ name: Build FFmpeg + ffprobe for Android with libs for flashback
 # or system install step is required. The libjni*.so files are loaded by
 # the JVM/ART class loader instead (via java.library.path or an APK's
 # jniLibs), not by ffmpeg/ffprobe themselves.
+#
+# SONAMES: every .so in the output carries a DT_SONAME; the executables
+# deliberately carry none. FFmpeg's own 7 libraries get versioned
+# SONAMEs (libavcodec.so.<major> etc.) baked in natively by the linker
+# via the config.mak patch in the FFmpeg build step. The 8 libjni*.so
+# files get their OWN unversioned filename as their SONAME, stamped in
+# after linking with patchelf (see the "Collect JNI shared libraries"
+# step) -- unversioned on purpose, because Bytedeco's Loader.load()
+# looks for exactly "libjniavcodec.so" and a version suffix would break
+# runtime lookup. The packaging step audits all of this and fails the
+# build rather than shipping a half-stamped zip.
 #
 # Every third-party codec/library below is built as a static (.a) archive
 # with -fPIC and gets linked INTO FFmpeg's own shared libraries at the
@@ -181,11 +192,13 @@ jobs:
       - name: Checkout workflow repo
         uses: actions/checkout@v4
 
+      # patchelf is used later to stamp DT_SONAME onto the libjni*.so
+      # files, which javacpp links without any -Wl,-soname of its own.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake build-essential cmake git \
-            libtool pkg-config wget yasm nasm meson ninja-build zip unzip
+            libtool pkg-config wget yasm nasm meson ninja-build zip unzip patchelf
 
       # Needed later for the JavaCPP / JavaCPP-Presets steps that build
       # the libjni*.so JNI bindings -- javacpp itself is a Java program
@@ -723,7 +736,7 @@ jobs:
       # time each FFmpeg version was cut. Quick reference for which
       # ffmpeg_version to pair with which svtav1_version:
       #
-      #   SVT-AV1 < 3.0.0 (this workflow's default, v2.3.0)
+      #   SVT-AV1 < 3.0.0  (this workflow's default, v2.3.0)
       #     -> any FFmpeg up to and including n6.1/release/6.1 (pre-6.1.2),
       #        release/4.4 (pre-backport), or plain "master" checked out
       #        before 22 Feb 2025. This is the default pairing above.
@@ -939,9 +952,10 @@ jobs:
           # macros already defined per-library; this only overrides how
           # they're *used* for shared-lib installation, not their values.
           # This is intentionally scoped to FFmpeg's own 7 libav*.so
-          # files only -- it has no effect on the JavaCPP libjni*.so
-          # bindings built later, which are a separate build system (see
-          # the note on that further down).
+          # files only -- the JavaCPP libjni*.so bindings get their
+          # SONAMEs stamped separately further down (see the "Collect JNI
+          # shared libraries" step), since they're a different build
+          # system and need unversioned names.
           echo "SHFLAGS before patch: $(grep '^SHFLAGS=' ffbuild/config.mak)"
 
           # Rewrite ONLY the -Wl,-soname,<name> argument, preserving
@@ -950,7 +964,7 @@ jobs:
             's|^(SHFLAGS=.*)-Wl,-soname,\$\(SLIBNAME\)(.*)$|\1-Wl,-soname,$(SLIBNAME_WITH_MAJOR)\2|' \
             ffbuild/config.mak
 
-          echo "SHFLAGS after patch:  $(grep '^SHFLAGS=' ffbuild/config.mak)"
+          echo "SHFLAGS after patch: $(grep '^SHFLAGS=' ffbuild/config.mak)"
 
           # Fail loudly rather than producing a broken link if either the
           # substitution didn't take or -Wl,-Bsymbolic went missing.
@@ -1004,14 +1018,17 @@ jobs:
       # libav*.so files -- here, the ones just built above with the extra
       # codecs, not a vanilla FFmpeg.
       #
-      # DELIBERATELY NOT SONAME-VERSIONED: unlike libavcodec.so etc.
-      # above, these libjni*.so files are loaded by Bytedeco's Java-side
-      # native loader (Loader.load(...)) using the exact unversioned
-      # names baked into the javacpp-presets annotations/generated code
-      # (e.g. it looks for exactly "libjniavcodec.so", never
-      # "libjniavcodec.so.<N>"). Giving them a SONAME/version suffix the
-      # way FFmpeg's own libs get one above would make JavaCV unable to
-      # find them at runtime, so they're intentionally left as-is here.
+      # SONAME'D, BUT DELIBERATELY NOT VERSIONED: javacpp links these
+      # without any -Wl,-soname at all, so they'd ship with an empty
+      # DT_SONAME. The "Collect JNI shared libraries" step below stamps
+      # each one with its OWN unversioned filename, so every .so in the
+      # package has a SONAME while Bytedeco's Java-side native loader
+      # (Loader.load(...)) still finds them: it looks for the exact
+      # unversioned names baked into the javacpp-presets annotations and
+      # generated code (e.g. exactly "libjniavcodec.so", never
+      # "libjniavcodec.so.<N>"). Giving them a version suffix the way
+      # FFmpeg's own libs get one above would make JavaCV unable to find
+      # them at runtime.
       - name: Clone JavaCPP ${{ env.JAVACPP_VERSION }}
         run: git clone --depth 1 --branch "${JAVACPP_VERSION}" https://github.com/bytedeco/javacpp.git javacpp-src
 
@@ -1184,17 +1201,17 @@ jobs:
           #    Builder falls back to target/classes + the platform's
           #    "platform.library.path" property. The android-*.properties
           #    files set that to lib/<abi>/, giving:
-          #       javacpp-src/target/classes/lib/${{ matrix.abi }}/libjnijavacpp.so
+          #      javacpp-src/target/classes/lib/${{ matrix.abi }}/libjnijavacpp.so
           #
           # 2. javacpp-presets (parent pom.xml, javacpp-compiler execution)
           #    DOES set one:
-          #       <outputDirectory>${project.build.directory}/native/${javacpp.platform.nativeOutputPath}</outputDirectory>
+          #      <outputDirectory>${project.build.directory}/native/${javacpp.platform.nativeOutputPath}</outputDirectory>
           #    and the "javacpp-platform-android-arm64" profile - which is
           #    auto-activated by -Djavacpp.platform=android-arm64 - overrides
-          #       <javacpp.platform.nativeOutputPath>${javacpp.platform.library.path}</javacpp.platform.nativeOutputPath>
+          #      <javacpp.platform.nativeOutputPath>${javacpp.platform.library.path}</javacpp.platform.nativeOutputPath>
           #    javacpp's BuildMojo re-exports every platform property into the
           #    Maven project as "javacpp.<key>", so that resolves to lib/<abi>/:
-          #       javacpp-presets-src/ffmpeg/target/native/lib/${{ matrix.abi }}/libjni*.so
+          #      javacpp-presets-src/ffmpeg/target/native/lib/${{ matrix.abi }}/libjni*.so
           #    i.e. target/native/, NOT target/classes/.
           #
           # Searching each module's whole target/ tree keeps this correct even
@@ -1220,6 +1237,27 @@ jobs:
           collect javacpp-src/target 'libjnijavacpp.so'
           collect javacpp-presets-src/ffmpeg/target 'libjni*.so'
 
+          # ---- Stamp DT_SONAME onto every libjni*.so ----
+          # javacpp links its JNI libs with no -Wl,-soname at all, so they
+          # ship with an empty DT_SONAME while FFmpeg's own libs above get
+          # a versioned one from the linker. Stamp each of these with its
+          # OWN filename -- UNVERSIONED on purpose: Bytedeco's
+          # Loader.load() resolves these by the exact fixed names baked
+          # into the javacpp-presets annotations (it looks for precisely
+          # "libjniavcodec.so"), so a ".N" suffix here would break runtime
+          # lookup with an UnsatisfiedLinkError. Done post-link with
+          # patchelf because javacpp's Maven build offers no reliable way
+          # to inject linker flags that holds across pinned preset
+          # versions (same reason cppbuild.sh gets neutralized above).
+          # This touches only the JNI libs -- FFmpeg's libav*.so keep
+          # their versioned SONAMEs, and ffmpeg/ffprobe are never touched
+          # (executables must not carry a DT_SONAME; the audit in the
+          # packaging step enforces both halves of that).
+          for so in "$JNI_STAGE_DIR"/*.so; do
+            patchelf --set-soname "$(basename "$so")" "$so"
+            echo "  soname($(basename "$so")): $("$TOOLCHAIN"/bin/llvm-readelf -d "$so" | grep -o 'SONAME.*')"
+          done
+
           echo "Collected JNI libs for ${{ matrix.abi }}:"
           ls -la "$JNI_STAGE_DIR"
 
@@ -1234,6 +1272,13 @@ jobs:
       # weight in the shipped package, not something anything actually
       # loads by that name. `-not -type l` skips it; `-maxdepth 1`
       # ignores pkgconfig/ and other install subdirectories.
+      #
+      # The SONAME audit at the end is the guarantee for this package's
+      # stated contract: all 15 .so files carry a DT_SONAME (7 versioned
+      # FFmpeg libs + 8 unversioned JNI libs) and neither executable
+      # does. It runs after llvm-strip on purpose -- stripping shouldn't
+      # touch .dynamic, and this proves it didn't. Any deviation fails
+      # the build instead of shipping a half-stamped zip.
       - name: Package ffmpeg + ffprobe + shared libs for ${{ matrix.abi }}
         run: |
           set -e
@@ -1247,6 +1292,24 @@ jobs:
 
           chmod +x "$PACKAGE_DIR/ffmpeg" "$PACKAGE_DIR/ffprobe"
           "$STRIP" "$PACKAGE_DIR"/*.so* || true
+
+          echo "SONAME audit for ${{ matrix.abi }}:"
+          rc=0
+          for f in "$PACKAGE_DIR"/*.so*; do
+            if "$TOOLCHAIN"/bin/llvm-readelf -d "$f" | grep -q SONAME; then
+              echo "  OK   $(basename "$f")"
+            else
+              echo "  FAIL $(basename "$f") has no DT_SONAME"; rc=1
+            fi
+          done
+          for exe in ffmpeg ffprobe; do
+            if "$TOOLCHAIN"/bin/llvm-readelf -d "$PACKAGE_DIR/$exe" | grep -q SONAME; then
+              echo "  FAIL $exe unexpectedly has a DT_SONAME"; rc=1
+            else
+              echo "  OK   $exe (no SONAME, as intended)"
+            fi
+          done
+          [ "$rc" -eq 0 ] || { echo "::error::SONAME audit failed"; exit 1; }
 
           mkdir -p "$GITHUB_WORKSPACE/dist"
           ARCHIVE="$GITHUB_WORKSPACE/dist/FFmpeg-android-${{ matrix.abi }}.zip"
@@ -1284,11 +1347,17 @@ jobs:
             echo "(\`libjniavcodec.so\`, \`libjniavformat.so\`,"
             echo "\`libjniavfilter.so\`, \`libjniavdevice.so\`,"
             echo "\`libjniavutil.so\`, \`libjniswscale.so\`,"
-            echo "\`libjniswresample.so\`, \`libjnijavacpp.so\`). Every codec"
-            echo "below is statically linked into the FFmpeg libraries, not"
-            echo "shipped as its own .so, and OpenH264's C++ runtime is"
-            echo "statically linked too (\`-lc++_static -lc++abi -nostdlib++\`)"
-            echo "-- so there is no \`libc++_shared.so\` in the output."
+            echo "\`libjniswresample.so\`, \`libjnijavacpp.so\`). Every one of"
+            echo "those 15 .so files carries a DT_SONAME -- versioned for"
+            echo "FFmpeg's own libs, unversioned (its own filename) for the"
+            echo "JNI libs, stamped with patchelf since javacpp emits none --"
+            echo "while \`ffmpeg\` and \`ffprobe\` deliberately carry no SONAME."
+            echo "The per-ABI build fails rather than shipping a zip that"
+            echo "violates that. Every codec below is statically linked into"
+            echo "the FFmpeg libraries, not shipped as its own .so, and"
+            echo "OpenH264's C++ runtime is statically linked too"
+            echo "(\`-lc++_static -lc++abi -nostdlib++\`) -- so there is no"
+            echo "\`libc++_shared.so\` in the output."
             echo ""
             echo "| Component | Version |"
             echo "|---|---|"
