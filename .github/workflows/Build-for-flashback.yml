@@ -1,4 +1,4 @@
-name: Build FFmpeg + ffprobe for Android with libs
+name: Build FFmpeg + ffprobe for Android with libs for flashback
 
 # Output shape: for each ABI, one FFmpeg-android-<abi>.zip containing
 # EXACTLY 17 files -- the ffmpeg and ffprobe executables, every FFmpeg
