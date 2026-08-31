@@ -1,4 +1,4 @@
-name: Build FFmpeg + ffprobe for Android with libs for flashback
+name: Build FFmpeg + ffprobe for Android with libs
 
 # Output shape: for each ABI, one FFmpeg-android-<abi>.zip containing
 # EXACTLY 17 files -- the ffmpeg and ffprobe executables, every FFmpeg
@@ -906,11 +906,25 @@ jobs:
           # variable is later expanded -- so appending these three lines
           # here reliably overrides configure's android-specific values
           # without needing to patch configure itself:
-          #   - SHFLAGS: adds -Wl,-soname,<name-with-major> to the link
-          #     command, which is what actually embeds the SONAME into
-          #     the .so's ELF header (and is what ffmpeg/ffprobe and the
-          #     later libjni*.so build will pick up as their DT_NEEDED
-          #     name at link time).
+          #   - SHFLAGS: the -Wl,-soname,<name> argument is what embeds
+          #     the SONAME into the .so's ELF header (and is what
+          #     ffmpeg/ffprobe and the later libjni*.so build pick up as
+          #     their DT_NEEDED name at link time). IMPORTANT: this is
+          #     rewritten in place with sed rather than re-echoed as a
+          #     whole new "SHFLAGS=..." line. configure builds SHFLAGS in
+          #     two stages -- the android target block sets
+          #     '-shared -Wl,-soname,$(SLIBNAME)' and a later generic
+          #     check appends '-Wl,-Bsymbolic'. Overwriting the variable
+          #     drops -Wl,-Bsymbolic, and without it the aarch64 NEON asm
+          #     (libavutil/aarch64/tx_float_neon.o) references data
+          #     symbols such as ff_tx_tab_32_float with ADRP/ADD
+          #     (R_AARCH64_ADR_PREL_PG_HI21 / R_AARCH64_ADD_ABS_LO12_NC)
+          #     absolute-page relocations, which are illegal against
+          #     preemptible globals in a -shared link. That fails at
+          #     "LD libavutil/libavutil.so.58" with a misleading
+          #     "recompile with -fPIC" error even though everything
+          #     already is PIC. So: substitute only the soname argument
+          #     and keep every other flag configure computed.
           #   - SLIB_INSTALL_NAME: the filename `make install` gives the
           #     real linked object, e.g. libavcodec.so.60.
           #   - SLIB_INSTALL_LINKS: an extra unversioned symlink
@@ -928,8 +942,26 @@ jobs:
           # files only -- it has no effect on the JavaCPP libjni*.so
           # bindings built later, which are a separate build system (see
           # the note on that further down).
+          echo "SHFLAGS before patch: $(grep '^SHFLAGS=' ffbuild/config.mak)"
+
+          # Rewrite ONLY the -Wl,-soname,<name> argument, preserving
+          # -Wl,-Bsymbolic and anything else configure put in SHFLAGS.
+          sed -i -E \
+            's|^(SHFLAGS=.*)-Wl,-soname,\$\(SLIBNAME\)(.*)$|\1-Wl,-soname,$(SLIBNAME_WITH_MAJOR)\2|' \
+            ffbuild/config.mak
+
+          echo "SHFLAGS after patch:  $(grep '^SHFLAGS=' ffbuild/config.mak)"
+
+          # Fail loudly rather than producing a broken link if either the
+          # substitution didn't take or -Wl,-Bsymbolic went missing.
+          grep -q 'SHFLAGS=.*-Wl,-soname,\$(SLIBNAME_WITH_MAJOR)' ffbuild/config.mak \
+            || { echo "ERROR: SHFLAGS soname patch did not apply"; exit 1; }
+          grep -q 'SHFLAGS=.*-Wl,-Bsymbolic' ffbuild/config.mak \
+            || { echo "ERROR: -Wl,-Bsymbolic missing from SHFLAGS; aarch64 asm will fail to link"; exit 1; }
+
+          # These two only affect `make install` naming, so a plain
+          # last-definition-wins append is safe for them.
           {
-            echo "SHFLAGS=-shared -Wl,-soname,\$(SLIBNAME_WITH_MAJOR)"
             echo "SLIB_INSTALL_NAME=\$(SLIBNAME_WITH_MAJOR)"
             echo "SLIB_INSTALL_LINKS=\$(SLIBNAME)"
           } >> ffbuild/config.mak
